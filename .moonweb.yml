@@ -1,0 +1,6 @@
+title: "opencode-prune"
+emoji: "🧹"
+category: code
+subcategory: "Dev Tools"
+status: active
+stack: [Bash, jq, SQLite, opencode]
