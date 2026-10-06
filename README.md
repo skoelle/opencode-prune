@@ -7,7 +7,8 @@
 |---|---|
 | 🏃 Dry run first | `./oc-prune-db.sh` – nothing is modified |
 | 💥 Delete | `./oc-prune-db.sh --apply` – export, then delete |
-| 🔒 Database | read-only (`sqlite3 -readonly`), only a local size cache is written |
+| 🗜️ Compact | `./oc-prune-db.sh --vacuum` – give the freed pages back to the disk |
+| 🔒 Database | read-only (`sqlite3 -readonly`), the only exception is `--vacuum` |
 | 📦 Export | every session is exported to `BACKUP` **before** it is deleted |
 
 ---
@@ -19,6 +20,7 @@
 - [📁 Files](#-files)
 - [⚙️ Configuration](#-configuration)
 - [🚀 Deleting sessions](#-deleting-sessions)
+- [🗜️ Reclaiming disk space](#-reclaiming-disk-space)
 - [🗄️ Database access](#-database-access)
 - [🧰 Requirements](#-requirements)
 - [⚠️ Gotchas](#-gotchas)
@@ -29,7 +31,7 @@
 
 ```
 Database (read-only): $HOME/.local/share/opencode/opencode.db
-  file 4.59 GiB | WAL 59.1 MiB | free inside 0 B (0.0 %)
+  file 4.59 GiB | WAL 59.1 MiB | freelist 0 B (0.0 %)
   sessions 381 (+ 199 subagents)
   Missing directories:
     /home/user/projects/legacy-tool                4 sessions (+2 subagents)
@@ -65,7 +67,7 @@ Dry run. To delete: ./oc-prune-db.sh --apply
 | | |
 |---|---|
 | 📂 | **Missing directories** with their session and subagent counts – your main cleanup targets |
-| 🏭 | **Table sizes** (`event`, `part`, `message`, `session`) and free space inside the file |
+| 🏭 | **Table sizes** (`event`, `part`, `message`, `session`) and the **freelist** – space inside the file that a `--vacuum` could give back |
 | 🕳️ | **Orphan events** without a session (should be `0`) |
 | ⏱️ | **Scan progress** per directory (`oc-prune.sh`) or a single `0 s` query (`oc-prune-db.sh`) |
 
@@ -149,15 +151,76 @@ What happens:
    then `opencode session delete <id>`. An empty export aborts the run **before**
    anything has been deleted.
 4. 🧬 Subagent sessions of missing directories run first, then the top-level sessions.
+5. 📊 at the end: `Freelist after delete: X` plus a hint that the file itself did not
+   shrink – and how to get the space back.
 
 > ❗ Without `--apply` nothing is exported and nothing is deleted.
 
 ---
 
+## 🗜️ Reclaiming disk space
+
+**opencode never shrinks its database itself.** The file is created with
+`auto_vacuum = NONE`, no release runs a `VACUUM`, and `opencode db` is only a query
+shell. Deleted sessions therefore only mark pages as *reusable inside the file*
+(`freelist` in the header) – the size on disk stays exactly the same until you compact
+it.
+
+```bash
+./oc-prune-db.sh --vacuum             # opencode must be closed
+./oc-prune-db.sh --apply --vacuum     # delete first, then compact
+```
+
+What `--vacuum` does, in order:
+
+1. 🛑 refuses to run while an `opencode` process exists
+2. 💾 checks that the filesystem has at least the size of the database free
+3. 🧽 `PRAGMA wal_checkpoint(TRUNCATE)` and `PRAGMA integrity_check`
+4. 🗜️ `VACUUM INTO '$DB.vac'` – a *copy*, the original stays untouched if anything fails
+5. ✅ `integrity_check` on the copy, then it replaces the original (the old
+   `-wal`/`-shm` go with it) and `journal_mode=wal` is restored
+6. 📉 prints `before`, `after` and what was freed
+
+The flag always works on the whole database – `ONLY` has no influence on it.
+
+### Why not a plain `VACUUM`?
+
+| | `VACUUM` (plain) | `VACUUM INTO` (what we do) |
+|---|---|---|
+| 💿 Free space needed | up to **2×** the file size | only the **compacted copy** |
+| 4.6 GiB database | ≈ 9.2 GiB – with 9.5 GiB free that is gambling | ≈ 3.3 GiB |
+| 🎯 Original file | rewritten in place | untouched until the final swap |
+
+### How much is really left?
+
+Deleting 2/3 of the sessions does **not** free 2/3 of the file – a real example:
+
+| | |
+|---|---|
+| 🗑️ deleted (368 sessions incl. subagents) | 1.43 GB |
+| 📅 still there, younger than `DAYS` | **3.16 GB** (98.4 % of what remains) |
+| 🔒 still there, old but within `MIN` | 0.05 GB |
+| 📚 indexes and page overhead | ~0.3 GB |
+
+Almost everything that stays is **recent sessions** – the rule only looks at `DAYS`.
+And their weight is not the messages themselves but their history: `message.updated`
+events store a **full snapshot on every update** (114k snapshots of 31.5k messages ≈
+3.7 GB, while the `message` table holds only 0.24 GB).
+
+💡 Want less than 3.3 GiB left over? Use a smaller `DAYS`, or hit one heavy directory:
+`ONLY=/path/to/heavy-project ./oc-prune-db.sh`. Removing the snapshot history itself is
+*compaction*, not vacuuming – upstream is working on that
+([#41711](https://github.com/anomalyco/opencode/pull/41711),
+[#31526](https://github.com/anomalyco/opencode/issues/31526)).
+
+---
+
 ## 🗄️ Database access
 
-Every access uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`). Only our own size
-cache under `~/.cache/oc-prune/` is ever written to.
+Every report, scan and table uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`).
+The **one exception is `--vacuum`**, which opens the database writable for the
+checkpoint and the `VACUUM INTO` – nothing else ever writes to it. Besides our own
+size cache under `~/.cache/oc-prune/` no other file is created.
 
 The `MB` values need a full scan of the `event` table (4 GiB, about 60 s) and are
 therefore cached; the key is `count/max(time_created)` so the cache stays valid while
@@ -176,7 +239,8 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 - 📊 `jq`
 - 🗄️ `sqlite3` ≥ 3.33 (for `-json`)
 - 🤖 `opencode` in `PATH`
-- 🔑 read access to the database
+- 🔑 read access to the database (`--vacuum` needs write access to it)
+- 📐 `df`, `stat`, `pgrep` (standard coreutils / procps)
 
 ---
 
@@ -188,6 +252,8 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 🚫 `GROUP BY 1` with aggregates in the same select list is forbidden in SQLite | `GROUP BY <column>` |
 | 📤 Progress messages on stdout corrupt `SESSIONS=$(…)` | print them with `printf … >&2` |
 | 🎯 `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line (`…/opencode-prune/…`) | `pgrep -x opencode` |
+| 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | `VACUUM INTO` + swap: only the compacted copy is needed, the original stays intact on failure |
+| ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
 
 ---
 

@@ -9,7 +9,7 @@ names, IDs or credentials may be committed (`.env` is gitignored for that reason
 
 | File | Contents |
 |---|---|
-| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_apply` |
+| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_apply`, `run_vacuum` |
 | `oc-prune.sh` | scan with `opencode session list` per directory, progress on stderr |
 | `oc-prune-db.sh` | scan with one `SELECT` (fast, complete) |
 | `.env` | local configuration; precedence: environment variable → `.env` → default |
@@ -21,11 +21,14 @@ logic into the lib instead of duplicating it.
 
 ## Rules
 
-- **Only read the opencode database with `sqlite3 -readonly`.** The only thing ever
-  written is our own size cache under `~/.cache/oc-prune/` (plus `$BACKUP` during an
-  export).
+- **Read the opencode database with `sqlite3 -readonly`.** The single exception is
+  `run_vacuum` (`--vacuum`): only there may the database be opened writable, for
+  `PRAGMA wal_checkpoint(TRUNCATE)`, `PRAGMA integrity_check`, `VACUUM INTO` and the
+  swap (including removal of the stale `-wal`/`-shm`). Every other path stays readonly.
+  Besides our size cache under `~/.cache/oc-prune/`, only `$BACKUP` is ever written to.
 - **Never run `--apply` without explicit approval.** Verify with a dry run and by
-  generating the target lists (see below).
+  generating the target lists (see below). The same holds for `--vacuum` against the
+  real database – it rewrites the file. Test vacuum mechanics on a copy in `/tmp`.
 - Global rules from `~/.config/opencode/AGENTS.md` apply as well (among others: no
   co-authors in commits).
 
@@ -37,6 +40,8 @@ logic into the lib instead of duplicating it.
   progress and info messages go through `printf … >&2`.
 - Set defaults only inside `oc_init`, **after** `load_env` – otherwise the default
   overwrites the value from `.env` and the file has no effect.
+- Flags (`--apply`, `--vacuum`, `--help`) are parsed once in `oc_args`; the entry
+  scripts only call `oc_init` + `oc_args "$@"`. Keep both scripts identical there.
 - Bind a variable before a jq filter uses it (`(.directory) as $d | if ($miss | index($d)) …`).
   `index(.[0].directory)` inside `$miss |` refers to the wrong `.` and jq reports a
   parse/type error.
@@ -76,8 +81,24 @@ Also keep `db_report`, which fills `OC_MISSING`/`OC_MISSING_DIRS`, and
 
 ```bash
 for f in oc-lib.sh oc-prune.sh oc-prune-db.sh; do bash -n "$f"; done
-SIZES=0 ./oc-prune-db.sh                  # dry run without size computation (~0 s)
+./oc-prune-db.sh --help                    # usage, exit 0
+./oc-prune-db.sh --quatsch                 # unknown option, exit 1
+SIZES=0 ./oc-prune-db.sh                   # dry run without size computation (~0 s)
+SIZES=0 ./oc-prune-db.sh --vacuum          # must stop: "opencode is still running"
 ONLY=/path/to/project ./oc-prune-db.sh     # dry run limited to one directory
+```
+
+Vacuum mechanics on an isolated copy (opencode faked as closed – never point this at
+the real `$DB`):
+
+```bash
+mkdir -p /tmp/oc-vac-test
+sqlite3 /tmp/oc-vac-test/test.db "PRAGMA journal_mode=WAL;
+  CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+  INSERT INTO t(v) SELECT randomblob(20000) FROM generate_series(1,6000);
+  DELETE FROM t WHERE id % 2 = 0;"
+bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }; DB=/tmp/oc-vac-test/test.db; run_vacuum'
+# expect: half the size, integrity_check ok, journal_mode wal, no leftover .vac
 ```
 
 To check target lists without deleting (no `opencode` call, no DB write): run the jq line

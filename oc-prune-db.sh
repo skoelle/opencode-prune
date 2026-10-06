@@ -5,9 +5,7 @@ set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/oc-lib.sh"
 oc_init
-
-APPLY=0
-[[ "${1:-}" == "--apply" ]] && APPLY=1
+oc_args "$@"
 
 CUTOFF=$(( ($(date +%s) - DAYS * 86400) * 1000 ))
 
