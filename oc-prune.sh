@@ -40,4 +40,5 @@ SESSIONS=$(oc_augment_missing "$SESSIONS")
 SESSIONS=$(oc_filter_only "$SESSIONS")
 db_sizes
 print_table "$SESSIONS"
+run_backup
 run_apply "$SESSIONS"

@@ -9,7 +9,7 @@ names, IDs or credentials may be committed (`.env` is gitignored for that reason
 
 | File | Contents |
 |---|---|
-| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_apply`, `run_vacuum` |
+| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup`, `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
 | `oc-prune.sh` | scan with `opencode session list` per directory, progress on stderr |
 | `oc-prune-db.sh` | scan with one `SELECT` (fast, complete) |
 | `.env` | local configuration; precedence: environment variable → `.env` → default |
@@ -24,8 +24,22 @@ logic into the lib instead of duplicating it.
 - **Read the opencode database with `sqlite3 -readonly`.** The single exception is
   `run_vacuum` (`--vacuum`): only there may the database be opened writable, for
   `PRAGMA wal_checkpoint(TRUNCATE)`, `PRAGMA integrity_check`, `VACUUM INTO` and the
-  swap (including removal of the stale `-wal`/`-shm`). Every other path stays readonly.
-  Besides our size cache under `~/.cache/oc-prune/`, only `$BACKUP` is ever written to.
+  swap (including removal of the stale `-wal`/`-shm`). Every other path stays readonly –
+  including `run_backup`, which copies with the read-only backup API
+  (`sqlite3 -readonly "$DB" ".backup …"`). Besides our size cache under
+  `~/.cache/oc-prune/`, only `$BACKUP` is ever written to.
+- **`run_vacuum` has two routes**, both writing only through `sqlw` + `mv`/`cp`: the
+  normal one (`VACUUM INTO '$DB.vac'` next to the database, needs 2× the file size
+  free) and `run_vacuum_remote` (into `$BACKUP`, then `cp` over the database – used
+  only when a terminal answered `y` to the question about the missing space). The
+  question is asked **only** with `--vacuum` and only when stdin is a terminal;
+  `OC_PROMPT=1` forces it for tests.
+- **`--vacuum` is backup-first**: `run_backup` runs before `run_apply` in both entry
+  scripts, so a copy exists before anything is deleted or rewritten. It needs the
+  directory `$BACKUP` to already exist (a not mounted path would silently write to `/`)
+  and as much free space there as the database is big. `run_vacuum` in turn **aborts
+  unless the database filesystem has 2× the file size free** – keep those two rules
+  when touching either function, and document them in the README command reference.
 - **Never run `--apply` without explicit approval.** Verify with a dry run and by
   generating the target lists (see below). The same holds for `--vacuum` against the
   real database – it rewrites the file. Test vacuum mechanics on a copy in `/tmp`.
@@ -40,8 +54,9 @@ logic into the lib instead of duplicating it.
   progress and info messages go through `printf … >&2`.
 - Set defaults only inside `oc_init`, **after** `load_env` – otherwise the default
   overwrites the value from `.env` and the file has no effect.
-- Flags (`--apply`, `--vacuum`, `--help`) are parsed once in `oc_args`; the entry
-  scripts only call `oc_init` + `oc_args "$@"`. Keep both scripts identical there.
+- Flags (`--apply`, `--vacuum`, `--no-backup`, `--help`) are parsed once in `oc_args`;
+  the entry scripts only call `oc_init` + `oc_args "$@"`. Keep both scripts identical
+  there, including the `run_backup` call before `run_apply`.
 - Bind a variable before a jq filter uses it (`(.directory) as $d | if ($miss | index($d)) …`).
   `index(.[0].directory)` inside `$miss |` refers to the wrong `.` and jq reports a
   parse/type error.
@@ -88,17 +103,39 @@ SIZES=0 ./oc-prune-db.sh --vacuum          # must stop: "opencode is still runni
 ONLY=/path/to/project ./oc-prune-db.sh     # dry run limited to one directory
 ```
 
-Vacuum mechanics on an isolated copy (opencode faked as closed – never point this at
-the real `$DB`):
+Backup + vacuum mechanics on isolated copies (opencode faked as closed – never point
+this at the real `$DB`):
 
 ```bash
-mkdir -p /tmp/oc-vac-test
+mkdir -p /tmp/oc-vac-test/bk
 sqlite3 /tmp/oc-vac-test/test.db "PRAGMA journal_mode=WAL;
   CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
   INSERT INTO t(v) SELECT randomblob(20000) FROM generate_series(1,6000);
   DELETE FROM t WHERE id % 2 = 0;"
-bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }; DB=/tmp/oc-vac-test/test.db; run_vacuum'
-# expect: half the size, integrity_check ok, journal_mode wal, no leftover .vac
+bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }; OC_BACKUP=1; OC_VACUUM=1
+  BACKUP=/tmp/oc-vac-test/bk; DB=/tmp/oc-vac-test/test.db; TMP=$(mktemp -d)
+  run_backup; run_vacuum'
+# expect: /tmp/oc-vac-test/bk/opencode-<ts>.db (integrity ok), half the size,
+#         integrity_check ok, journal_mode wal, no leftover .vac
+bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }; OC_BACKUP=0; OC_VACUUM=1
+  BACKUP=/tmp/oc-vac-test/bk; DB=/tmp/oc-vac-test/test.db; TMP=$(mktemp -d)
+  run_backup; run_vacuum'
+# expect: no new file in bk/, same vacuum result
+```
+
+The fallback question (stub `oc_free_bytes` so the local disk looks too small, but
+still large enough for the compacted copy; `OC_PROMPT=1` fakes the terminal):
+
+```bash
+OC_PROMPT=1 bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }
+  oc_free_bytes(){ if [[ "$1" == "$(dirname "$DB")" ]]; then echo 130000000;
+    else df -B1 --output=avail "$1" | tail -n1 | tr -d " "; fi; }
+  BACKUP=/tmp/oc-vac-test/bk; DB=/tmp/oc-vac-test/test.db; TMP=$(mktemp -d)
+  run_vacuum' <<< y
+# expect: "Do it via the backup target? [y/N]", VACUUM INTO $BACKUP/vacuum-<ts>.db,
+#         copy back, integrity ok, temporary copy removed
+# <<< n  -> "Aborted – nothing was changed", database unchanged
+# without OC_PROMPT and stdin < /dev/null -> "Free space first", exit 1
 ```
 
 To check target lists without deleting (no `opencode` call, no DB write): run the jq line

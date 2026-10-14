@@ -28,4 +28,5 @@ printf 'scan (db): %s sessions without subagents in %s s\n' \
 
 db_sizes
 print_table "$SESSIONS"
+run_backup
 run_apply "$SESSIONS"

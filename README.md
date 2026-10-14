@@ -7,7 +7,7 @@
 |---|---|
 | 🏃 Dry run first | `./oc-prune-db.sh` – nothing is modified |
 | 💥 Delete | `./oc-prune-db.sh --apply` – export, then delete |
-| 🗜️ Compact | `./oc-prune-db.sh --vacuum` – give the freed pages back to the disk |
+| 🗜️ Compact | `./oc-prune-db.sh --vacuum` – verified backup of the database, then compact it |
 | 🔒 Database | read-only (`sqlite3 -readonly`), the only exception is `--vacuum` |
 | 📦 Export | every session is exported to `BACKUP` **before** it is deleted |
 
@@ -17,6 +17,7 @@
 
 - [✨ What you get](#-what-you-get)
 - [🗑️ Deletion rules](#-deletion-rules)
+- [🧭 Command reference](#-command-reference)
 - [📁 Files](#-files)
 - [⚙️ Configuration](#-configuration)
 - [🚀 Deleting sessions](#-deleting-sessions)
@@ -84,11 +85,72 @@ Dry run. To delete: ./oc-prune-db.sh --apply
 
 ---
 
+## 🧭 Command reference
+
+Every command starts with the same report and the same table – only the options after
+that differ. Steps in **bold** are the ones that change something.
+
+### `./oc-prune-db.sh` (no option) – dry run
+
+1. read environment and `.env`
+2. open the database **read-only**: file size, WAL, freelist, session count,
+   missing directories, table sizes, orphan events, data per directory
+3. **read-only scan** of all top-level sessions (one `SELECT`; `oc-prune.sh` runs
+   `opencode session list` per directory instead)
+4. the table with the `DELETE` counts and the total
+5. `Dry run. To delete: …` – nothing is exported, nothing is deleted, the database is
+   never opened writable
+
+### `--apply` – export and delete
+
+1. 🛑 `pgrep -x opencode` – abort with code 1 while an instance runs
+2. `Export to: $BACKUP`, create the directory
+3. build the target list (rule 2 and rule 1), subagents of missing directories first
+4. **per session**: `opencode export <id> > $BACKUP/<directory>/<id>.json` → an empty
+   export **aborts** the run → `opencode session delete <id>`
+5. `Freelist after delete: …` plus the hint to compact with `--vacuum`
+
+### `--vacuum` – backup and compact (with or without `--apply`)
+
+1. 🛑 `pgrep -x opencode` – abort with code 1 while an instance runs
+2. **backup** (skipped with `--no-backup`):
+   `$BACKUP` must already exist and have at least the size of the database free →
+   `sqlite3 -readonly "$DB" ".backup '$BACKUP/opencode-<timestamp>.db'"` →
+   size compared with the original → `PRAGMA integrity_check` on the copy
+3. **space check**: the filesystem of the database must have at least **2×** the file
+   size free (a plain `VACUUM` can need that much), otherwise abort
+4. **if that check fails and a terminal is attached**: the question
+   `Do it via the backup target? [y/N]` – on `y` the compacted copy is written to
+   `$BACKUP` and copied back over the database ([details](#when-the-disk-is-too-small)),
+   on `n` the run stops without changing anything
+5. `PRAGMA wal_checkpoint(TRUNCATE)` – abort if the WAL stays non-empty
+6. `PRAGMA integrity_check` on the database
+7. **`VACUUM INTO '$DB.vac'`** – a copy, the original is untouched if anything fails
+8. `PRAGMA integrity_check` on the copy, then the **swap**: `mv` over `$DB`, the old
+   `-wal`/`-shm` are removed, `journal_mode=wal` is restored
+9. `before`, `after` and what was freed
+
+### The combinations
+
+| Command | Steps that run |
+|---|---|
+| *(none)* | report + table (read-only) |
+| `--apply` | report + table → export + delete → freelist hint |
+| `--vacuum` | report + table → **backup** → **compact** |
+| `--apply --vacuum` | report + table → **backup** → export + delete → **compact** |
+| `--apply --vacuum --no-backup` | same, but without the backup copy |
+| `--no-backup` alone | same as a dry run (backup only ever matters with `--vacuum`) |
+
+> ❗ The backup and the compaction always cover the **whole database** – `ONLY` has no
+> influence on them. `ONLY` only limits which sessions are shown, exported and deleted.
+
+---
+
 ## 📁 Files
 
 | File | Emoji | Purpose |
 |---|---|---|
-| `oc-lib.sh` | 📚 | shared logic: database report, table, totals, `--apply` |
+| `oc-lib.sh` | 📚 | shared logic: database report, table, totals, backup, `--apply`, `--vacuum` |
 | `oc-prune.sh` | 🐢 | scan with `opencode session list` per directory (shows progress) |
 | `oc-prune-db.sh` | 🐇 | scan with a single `SELECT` (0 s instead of ~70 s) |
 | `.env` | 🔐 | local configuration (gitignored), see `.env.example` |
@@ -113,7 +175,7 @@ by `oc_augment_missing` in both scripts.
 | `ROOT` | `$HOME/Code` | root that gets scanned; rows outside get `outside` |
 | `DAYS` | `30` | sessions older than that are candidates for deletion |
 | `MIN` | `3` | this many youngest sessions stay per directory |
-| `BACKUP` | `$HOME/opencode-export` | export target before deleting |
+| `BACKUP` | `$HOME/opencode-export` | receives the exports of deleted sessions **and** (with `--vacuum`) the full database copy `opencode-<timestamp>.db`; the directory must already exist |
 | `DB` | `~/.local/share/opencode/opencode.db` | opencode database |
 | `ONLY` | *(empty)* | work on this directory (and everything below) only |
 | `SIZES` | `1` | `0` skips the size computation (the `MB` column stays `-`) |
@@ -168,28 +230,72 @@ it.
 
 ```bash
 ./oc-prune-db.sh --vacuum             # opencode must be closed
-./oc-prune-db.sh --apply --vacuum     # delete first, then compact
+./oc-prune-db.sh --apply --vacuum     # backup, delete, then compact
+./oc-prune-db.sh --apply --vacuum --no-backup   # without the backup copy
 ```
 
-What `--vacuum` does, in order:
+The exact step list of every command is in
+[🧭 Command reference](#-command-reference); the essentials of `--vacuum`:
 
-1. 🛑 refuses to run while an `opencode` process exists
-2. 💾 checks that the filesystem has at least the size of the database free
-3. 🧽 `PRAGMA wal_checkpoint(TRUNCATE)` and `PRAGMA integrity_check`
-4. 🗜️ `VACUUM INTO '$DB.vac'` – a *copy*, the original stays untouched if anything fails
-5. ✅ `integrity_check` on the copy, then it replaces the original (the old
-   `-wal`/`-shm` go with it) and `journal_mode=wal` is restored
-6. 📉 prints `before`, `after` and what was freed
+- 💾 it starts with a **verified full copy** of the database in `$BACKUP`
+  (`opencode-<timestamp>.db`, copied with the read-only backup API)
+- 📏 it **aborts** unless the database filesystem has **2×** the file size free
+- 🗜️ it compacts with `VACUUM INTO` and only swaps the file in after the copy
+  passed an `integrity_check`
+- 💬 in a terminal it **asks** when the disk is too small for the 2× reserve –
+  see the next section
 
-The flag always works on the whole database – `ONLY` has no influence on it.
+### When the disk is too small
+
+Sometimes the disk simply cannot hold the reserve (a 5 GiB database on a disk with
+5.5 GiB free is the typical case). In a terminal `--vacuum` then asks:
+
+```
+  Not enough free space for the normal route: a vacuum can need up to
+  twice the file size (10.83 GiB), only 5.47 GiB is free.
+  Compact via /mnt/backup/opencode instead: the copy travels over the network and the
+  database is overwritten in place, so locally only the size of the
+  compacted copy (up to 5.41 GiB) is needed – 5.47 GiB is free.
+  Do it via the backup target? [y/N]
+```
+
+On `y` the route is: checkpoint → `integrity_check` → `VACUUM INTO $BACKUP/vacuum-<ts>.db`
+→ `integrity_check` on that copy → `cp` it over the database (which frees the old
+pages first) → `integrity_check` again → remove the temporary copy. The local peak is
+the size of the **compacted** copy instead of 2× the original – which is exactly the
+space that was missing. On `n` (or without a terminal, e.g. in a script) the run stops
+and nothing is changed.
+
+> ⚠️ During the copy the local database *is* the new file – if that copy dies halfway
+> the verified file on the backup target is the way back:
+> `cp $BACKUP/vacuum-<ts>.db ~/.local/share/opencode/opencode.db`
+
+What the tail of a full run looks like:
+
+```
+Backup:
+  to /mnt/backup/opencode | size 4.59 GiB | free there 9.49 TiB
+  copying … done
+  /mnt/backup/opencode/opencode-20261014-221530.db (integrity ok, 96s)
+Export to: /mnt/backup/opencode
+deleting [1/267] ses_… (/home/user/projects/legacy-tool) … deleted
+…
+Freelist after delete: 1.33 GiB – the file itself does not shrink
+
+Vacuum:
+  before 4.59 GiB | free on disk 9.54 GiB | reserve 9.18 GiB
+  integrity check … ok
+  VACUUM INTO opencode.db.vac … done
+  after  3.26 GiB (freed 1.33 GiB)
+```
 
 ### Why not a plain `VACUUM`?
 
 | | `VACUUM` (plain) | `VACUUM INTO` (what we do) |
 |---|---|---|
-| 💿 Free space needed | up to **2×** the file size | only the **compacted copy** |
-| 4.6 GiB database | ≈ 9.2 GiB – with 9.5 GiB free that is gambling | ≈ 3.3 GiB |
-| 🎯 Original file | rewritten in place | untouched until the final swap |
+| 💿 Worst case free space | up to **2×** the file size | only the **compacted copy** |
+| 🛟 If it fails halfway | original already rewritten | original untouched until the swap |
+| 📏 What we reserve | **2×** – we check for it and abort early | same rule, so the worst case is covered |
 
 ### How much is really left?
 
@@ -217,10 +323,11 @@ events store a **full snapshot on every update** (114k snapshots of 31.5k messag
 
 ## 🗄️ Database access
 
-Every report, scan and table uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`).
-The **one exception is `--vacuum`**, which opens the database writable for the
-checkpoint and the `VACUUM INTO` – nothing else ever writes to it. Besides our own
-size cache under `~/.cache/oc-prune/` no other file is created.
+Every report, scan and table uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`),
+and so does the backup copy (`sqlite3 -readonly "$DB" ".backup …"`). The **one
+exception is `--vacuum`**, which opens the database writable for the checkpoint and
+the `VACUUM INTO` – nothing else ever writes to it. Besides our own size cache under
+`~/.cache/oc-prune/` and the files under `$BACKUP` nothing else is created.
 
 The `MB` values need a full scan of the `event` table (4 GiB, about 60 s) and are
 therefore cached; the key is `count/max(time_created)` so the cache stays valid while
@@ -252,8 +359,10 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 🚫 `GROUP BY 1` with aggregates in the same select list is forbidden in SQLite | `GROUP BY <column>` |
 | 📤 Progress messages on stdout corrupt `SESSIONS=$(…)` | print them with `printf … >&2` |
 | 🎯 `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line (`…/opencode-prune/…`) | `pgrep -x opencode` |
-| 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | `VACUUM INTO` + swap: only the compacted copy is needed, the original stays intact on failure |
+| 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we **reserve 2×** (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
 | ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
+| 📡 writing the backup onto an unmounted path would silently fill `/` | `$BACKUP` must already exist, otherwise the run stops before copying anything |
+| 📉 the disk is too small for the 2× reserve (typical for a big database) | in a terminal `--vacuum` asks whether to compact via `$BACKUP` instead; scripts abort and have to free space themselves |
 
 ---
 

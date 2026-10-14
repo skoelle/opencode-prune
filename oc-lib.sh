@@ -1,11 +1,13 @@
 # oc-lib.sh – shared reporting and deletion logic for oc-prune.sh / oc-prune-db.sh
 # The opencode database is only read with "sqlite3 -readonly" – one exception:
 # run_vacuum (--vacuum) opens it writable for the checkpoint and VACUUM INTO.
+# run_backup uses the read-only backup API (".backup") and writes only to $BACKUP.
 # Otherwise nothing is written except our own size cache.
 
 declare -a OC_MISSING_DIRS=()
 APPLY=0
 OC_VACUUM=0
+OC_BACKUP=1
 OC_MISSING='[]'
 OC_DATA_NOTE='-'
 OC_T_EV=0
@@ -58,12 +60,14 @@ sqlw() { sqlite3 -cmd 'PRAGMA cache_size=8000;' "$DB" "$1"; }
 
 oc_usage() {
   cat <<EOF
-Usage: $0 [--apply] [--vacuum]
+Usage: $0 [--apply] [--vacuum] [--no-backup]
 
   (no option)   dry run: report + table, nothing is modified
   --apply       export each session to \$BACKUP, then delete it
-  --vacuum      compact the database (opencode must be closed)
-                needs free disk space of at least the database size
+  --vacuum      full backup of the database to \$BACKUP, then compact it
+                (opencode must be closed, needs twice the database size free;
+                in a terminal it can compact via \$BACKUP if the disk is too small)
+  --no-backup   with --vacuum: compact without the backup copy
 
 Configuration: environment variable -> .env -> default
   ROOT DAYS MIN BACKUP DB ONLY SIZES SIZE_CACHE
@@ -75,9 +79,10 @@ oc_args() {
   local a
   for a in "$@"; do
     case "$a" in
-      --apply)   APPLY=1 ;;
-      --vacuum)  OC_VACUUM=1 ;;
-      -h|--help) oc_usage; exit 0 ;;
+      --apply)    APPLY=1 ;;
+      --vacuum)   OC_VACUUM=1 ;;
+      --no-backup) OC_BACKUP=0 ;;
+      -h|--help)  oc_usage; exit 0 ;;
       *) printf 'Unknown option: %s (try %s --help)\n' "$a" "$0" >&2
          return 1 ;;
     esac
@@ -93,6 +98,16 @@ fmt_b() {
 }
 
 db_readable() { command -v sqlite3 >/dev/null 2>&1 && [[ -r "$DB" ]]; }
+
+# "-x" matches the exact process name – "-f opencode" would also match
+# "vim opencode.json" and our own command line (…/opencode-prune/…)
+oc_guard_closed() {
+  pgrep -u "$USER" -x opencode >/dev/null && {
+    echo "opencode is still running, please quit it first." >&2; exit 1; }
+  return 0
+}
+
+oc_free_bytes() { df -B1 --output=avail "$1" | tail -n1 | tr -d ' '; }
 
 # header: file size, WAL, free pages, session count, missing directories
 db_report() {
@@ -329,6 +344,65 @@ print_table() {
     "${tot_n:-0}" "${tot_dirs:-0}" "${tot_k:-0}"
 }
 
+# full copy of the database to $BACKUP, verified – runs before anything
+# destructive. The source stays readonly; ".backup" copies through the backup
+# API and therefore yields a consistent snapshot even with a WAL present.
+run_backup() {
+  # only --vacuum rewrites the file, so only --vacuum needs this safety net
+  (( OC_BACKUP )) || return 0
+  (( OC_VACUUM )) || return 0
+
+  printf '\nBackup:\n'
+  if ! db_readable; then
+    printf '  sqlite3 or %s not available\n' "$DB" >&2
+    return 1
+  fi
+  oc_guard_closed
+
+  local file_b avail dest chk t0
+  file_b=$(stat -c%s "$DB")
+
+  if [[ ! -d "$BACKUP" ]]; then
+    printf '  Backup directory does not exist: %s\n' "$BACKUP" >&2
+    printf '  Create it (and mount its filesystem) first.\n' >&2
+    return 1
+  fi
+  avail=$(oc_free_bytes "$BACKUP")
+  printf '  to %s | size %s | free there %s\n' \
+    "$BACKUP" "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")"
+  if [[ "${avail:-0}" -lt "$file_b" ]]; then
+    printf '  Not enough free space at the target: %s needed, %s free.\n' \
+      "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")" >&2
+    return 1
+  fi
+
+  dest="$BACKUP/opencode-$(date +%Y%m%d-%H%M%S).db"
+  t0=$(date +%s)
+  printf '  copying … '
+  if ! sqlite3 -readonly "$DB" ".backup '$dest'"; then
+    printf 'FAILED\n' >&2
+    rm -f "$dest"
+    return 1
+  fi
+  echo done
+
+  if [[ "$(stat -c%s "$dest")" != "$file_b" ]]; then
+    printf '  size mismatch: %s instead of %s – aborting.\n' \
+      "$(fmt_b "$(stat -c%s "$dest")")" "$(fmt_b "$file_b")" >&2
+    return 1
+  fi
+  chk=$(sqlite3 -readonly "$dest" 'PRAGMA integrity_check;') || chk=''
+  if [[ "$chk" != "ok" ]]; then
+    printf '  integrity check of the copy FAILED (%s) – aborting.\n' "$chk" >&2
+    return 1
+  fi
+  # reading a WAL-mode copy creates an empty -wal/-shm next to it – drop them
+  if [[ ! -f "$dest-wal" || "$(stat -c%s "$dest-wal")" -eq 0 ]]; then
+    rm -f "$dest-wal" "$dest-shm"
+  fi
+  printf '  %s (integrity ok, %ss)\n' "$dest" "$(( $(date +%s) - t0 ))"
+}
+
 run_apply() {
   local sessions=$1
 
@@ -342,10 +416,7 @@ run_apply() {
     exit 0
   fi
 
-  # -x: exact process name "opencode" – "-f opencode" would also match
-  # "vim opencode.json" and our own command line (…/opencode-prune/…)
-  pgrep -u "$USER" -x opencode >/dev/null && {
-    echo "opencode is still running, please quit it first." >&2; exit 1; }
+  oc_guard_closed
 
   printf 'Export to: %s\n' "$BACKUP"
   mkdir -p "$BACKUP" 2>/dev/null || {
@@ -413,38 +484,9 @@ run_apply() {
   fi
 }
 
-# compact the database – the only place where it is opened writable.
-# VACUUM INTO instead of a plain VACUUM: a plain VACUUM needs up to twice the
-# file size as free space, VACUUM INTO only needs the compacted copy.
-run_vacuum() {
-  printf '\nVacuum:\n'
-  if ! db_readable; then
-    printf '  sqlite3 or %s not available\n' "$DB" >&2
-    return 1
-  fi
-
-  # -x: exact process name, "-f opencode" would match our own command line
-  pgrep -u "$USER" -x opencode >/dev/null && {
-    echo "opencode is still running, please quit it first." >&2; exit 1; }
-
-  local file_b avail tmp busy chk after
-  file_b=$(stat -c%s "$DB")
-  avail=$(df -B1 --output=avail "$(dirname "$DB")" | tail -n1 | tr -d ' ')
-  tmp="$DB.vac"
-
-  printf '  before %s | free on disk %s\n' \
-    "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")"
-  if [[ "${avail:-0}" -lt "$file_b" ]]; then
-    printf '  Not enough free space: the compacted copy can be as large as the\n' >&2
-    printf '  database itself (%s), only %s is free.\n' \
-      "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")" >&2
-    return 1
-  fi
-  if [[ -e "$tmp" ]]; then
-    printf '  Refusing: %s already exists – remove it first.\n' "$tmp" >&2
-    return 1
-  fi
-
+# checkpoint + integrity check – shared by both vacuum routes
+vacuum_prepare() {
+  local busy chk
   busy=$(sqlw 'PRAGMA wal_checkpoint(TRUNCATE);') || busy=''
   if [[ "${busy%%|*}" != "0" ]]; then
     printf '  WAL checkpoint failed (%s) – is opencode really closed?\n' "$busy" >&2
@@ -455,7 +497,6 @@ run_vacuum() {
       "$(fmt_b "$(stat -c%s "$DB-wal")")" >&2
     return 1
   fi
-
   printf '  integrity check … '
   chk=$(sqlw 'PRAGMA integrity_check;') || chk=''
   if [[ "$chk" != "ok" ]]; then
@@ -463,6 +504,62 @@ run_vacuum() {
     return 1
   fi
   echo ok
+}
+
+# compact the database – the only place where it is opened writable.
+# VACUUM INTO instead of a plain VACUUM: a plain VACUUM needs up to twice the
+# file size as free space, VACUUM INTO only needs the compacted copy.
+run_vacuum() {
+  printf '\nVacuum:\n'
+  if ! db_readable; then
+    printf '  sqlite3 or %s not available\n' "$DB" >&2
+    return 1
+  fi
+
+  oc_guard_closed
+
+  local file_b avail tmp chk after need a
+  file_b=$(stat -c%s "$DB")
+  need=$(( file_b * 2 ))
+  avail=$(oc_free_bytes "$(dirname "$DB")")
+  tmp="$DB.vac"
+
+  printf '  before %s | free on disk %s | reserve %s\n' \
+    "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")" "$(fmt_b "$need")"
+
+  if [[ "${avail:-0}" -lt "$need" ]]; then
+    printf '  Not enough free space for the normal route: a vacuum can need up to\n' >&2
+    printf '  twice the file size (%s), only %s is free.\n' \
+      "$(fmt_b "$need")" "$(fmt_b "${avail:-0}")" >&2
+    # only --vacuum ever gets here, and only a terminal is asked – scripted
+    # runs must free the space themselves (OC_PROMPT=1 forces the question)
+    if [[ -t 0 || "${OC_PROMPT:-}" == "1" ]] && [[ -d "$BACKUP" ]]; then
+      printf '  Compact via %s instead: the copy travels over the network and the\n' \
+        "$BACKUP" >&2
+      printf '  database is overwritten in place, so locally only the size of the\n' >&2
+      printf '  compacted copy (up to %s) is needed – %s is free.\n' \
+        "$(fmt_b "$file_b")" "$(fmt_b "$avail")" >&2
+      printf '  Do it via the backup target? [y/N] ' >&2
+      a=''
+      read -r a || a=''
+      case "$a" in
+        [yY]*) run_vacuum_remote "$file_b" "$avail"; return $? ;;
+        *) printf '  Aborted – nothing was changed.\n' >&2; return 1 ;;
+      esac
+    fi
+    if [[ -d "${BACKUP:-}" ]]; then
+      printf '  Free space first (or attach a terminal to compact via %s).\n' "$BACKUP" >&2
+    else
+      printf '  Free space first.\n' >&2
+    fi
+    return 1
+  fi
+  if [[ -e "$tmp" ]]; then
+    printf '  Refusing: %s already exists – remove it first.\n' "$tmp" >&2
+    return 1
+  fi
+
+  vacuum_prepare || return 1
 
   printf '  VACUUM INTO %s … ' "$(basename "$tmp")"
   sqlw "VACUUM INTO '$tmp';" >/dev/null
@@ -484,4 +581,67 @@ run_vacuum() {
   after=$(stat -c%s "$DB")
   printf '  after  %s (freed %s)\n' \
     "$(fmt_b "$after")" "$(fmt_b "$(( file_b - after ))")"
+}
+
+# fallback when the database filesystem is too small: write the compacted copy
+# to the backup target and copy it back over the database. "cp" truncates its
+# target first, so only the size of the compacted copy is needed locally – the
+# verified copy on the backup target stays until the local one passed its check.
+run_vacuum_remote() {
+  local file_b=$1 avail=$2 dest navail chk after
+  dest="$BACKUP/vacuum-$(date +%Y%m%d-%H%M%S).db"
+
+  if [[ "${avail:-0}" -lt "$file_b" ]]; then
+    printf '  Not enough free space locally for the compacted copy (up to %s, %s free).\n' \
+      "$(fmt_b "$file_b")" "$(fmt_b "$avail")" >&2
+    return 1
+  fi
+  navail=$(oc_free_bytes "$BACKUP")
+  if [[ "${navail:-0}" -lt "$file_b" ]]; then
+    printf '  Not enough free space at %s: %s needed, %s free.\n' \
+      "$BACKUP" "$(fmt_b "$file_b")" "$(fmt_b "${navail:-0}")" >&2
+    return 1
+  fi
+  if [[ -e "$dest" ]]; then
+    printf '  Refusing: %s already exists – remove it first.\n' "$dest" >&2
+    return 1
+  fi
+
+  vacuum_prepare || return 1
+
+  printf '  VACUUM INTO %s (over the network, this takes a while) … ' "$dest"
+  sqlw "VACUUM INTO '$dest';" >/dev/null
+  echo done
+
+  printf '  integrity check of the copy … '
+  chk=$(sqlite3 -readonly "$dest" 'PRAGMA integrity_check;') || chk=''
+  if [[ "$chk" != "ok" ]]; then
+    printf 'FAILED (%s) – database untouched.\n' "$chk" >&2
+    return 1
+  fi
+  echo ok
+
+  printf '  copying it back over %s … ' "$(basename "$DB")"
+  if ! cp -f "$dest" "$DB"; then
+    printf 'FAILED – restore with: cp %s %s\n' "$dest" "$DB" >&2
+    return 1
+  fi
+  echo done
+
+  # the emptied WAL/SHM belong to the old file, never reuse them
+  rm -f "$DB-wal" "$DB-shm"
+
+  chk=$(sqlw 'PRAGMA integrity_check;') || chk=''
+  if [[ "$chk" != "ok" ]]; then
+    printf '  integrity check of the database FAILED (%s)\n' "$chk" >&2
+    printf '  restore it with: cp %s %s\n' "$dest" "$DB" >&2
+    return 1
+  fi
+  sqlw 'PRAGMA journal_mode=WAL;' >/dev/null || true
+
+  after=$(stat -c%s "$DB")
+  printf '  after  %s (freed %s)\n' \
+    "$(fmt_b "$after")" "$(fmt_b "$(( file_b - after ))")"
+  rm -f "$dest"
+  printf '  (temporary copy at the backup target removed)\n'
 }
