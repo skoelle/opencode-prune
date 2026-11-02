@@ -122,7 +122,9 @@ that differ. Steps in **bold** are the ones that change something.
 4. **if that check fails and a terminal is attached**: the question
    `Do it via the backup target? [y/N]` – on `y` the compacted copy is written to
    `$BACKUP` and copied back over the database ([details](#when-the-disk-is-too-small)),
-   on `n` the run stops without changing anything
+   on `n` the run stops without changing anything. The local space is checked
+   against the **actual** size of the compacted copy: `cp` truncates the database
+   first, so it fits as long as `compacted ≤ file + free`
 5. `PRAGMA wal_checkpoint(TRUNCATE)` – abort if the WAL stays non-empty
 6. `PRAGMA integrity_check` on the database
 7. **`VACUUM INTO '$DB.vac'`** – a copy, the original is untouched if anything fails
@@ -243,7 +245,8 @@ The exact step list of every command is in
 - 🗜️ it compacts with `VACUUM INTO` and only swaps the file in after the copy
   passed an `integrity_check`
 - 💬 in a terminal it **asks** when the disk is too small for the 2× reserve –
-  see the next section
+  the backup-target route then needs only the actual compacted size (the old file
+  is freed first), see the next section
 
 ### When the disk is too small
 
@@ -253,18 +256,21 @@ Sometimes the disk simply cannot hold the reserve (a 5 GiB database on a disk wi
 ```
   Not enough free space for the normal route: a vacuum can need up to
   twice the file size (10.83 GiB), only 5.47 GiB is free.
-  Compact via /mnt/backup/opencode instead: the copy travels over the network and the
-  database is overwritten in place, so locally only the size of the
-  compacted copy (up to 5.41 GiB) is needed – 5.47 GiB is free.
+  Compact via /mnt/backup/opencode instead: the compacted copy travels over the
+  network and is copied over the database, which frees the old file
+  first. It fits locally as long as the compacted copy is at most
+  10.88 GiB (old file + 5.47 GiB free).
   Do it via the backup target? [y/N]
 ```
 
 On `y` the route is: checkpoint → `integrity_check` → `VACUUM INTO $BACKUP/vacuum-<ts>.db`
-→ `integrity_check` on that copy → `cp` it over the database (which frees the old
-pages first) → `integrity_check` again → remove the temporary copy. The local peak is
-the size of the **compacted** copy instead of 2× the original – which is exactly the
-space that was missing. On `n` (or without a terminal, e.g. in a script) the run stops
-and nothing is changed.
+→ `integrity_check` on that copy → check its **actual** size against
+`old file + free space` → `cp` it over the database (which frees the old pages first)
+→ `integrity_check` again → remove the temporary copy. The local peak is the size of
+the **compacted** copy instead of 2× the original – which is exactly the space that
+was missing. If even that does not fit, the database stays untouched and the verified
+copy stays on the backup target (`cp $BACKUP/vacuum-<ts>.db …` once space is free).
+On `n` (or without a terminal, e.g. in a script) the run stops and nothing is changed.
 
 > ⚠️ During the copy the local database *is* the new file – if that copy dies halfway
 > the verified file on the backup target is the way back:

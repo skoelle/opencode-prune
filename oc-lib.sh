@@ -534,11 +534,12 @@ run_vacuum() {
     # only --vacuum ever gets here, and only a terminal is asked – scripted
     # runs must free the space themselves (OC_PROMPT=1 forces the question)
     if [[ -t 0 || "${OC_PROMPT:-}" == "1" ]] && [[ -d "$BACKUP" ]]; then
-      printf '  Compact via %s instead: the copy travels over the network and the\n' \
+      printf '  Compact via %s instead: the compacted copy travels over the\n' \
         "$BACKUP" >&2
-      printf '  database is overwritten in place, so locally only the size of the\n' >&2
-      printf '  compacted copy (up to %s) is needed – %s is free.\n' \
-        "$(fmt_b "$file_b")" "$(fmt_b "$avail")" >&2
+      printf '  network and is copied over the database, which frees the old file\n' >&2
+      printf '  first. It fits locally as long as the compacted copy is at most\n' >&2
+      printf '  %s (old file + %s free).\n' \
+        "$(fmt_b "$(( file_b + avail ))")" "$(fmt_b "$avail")" >&2
       printf '  Do it via the backup target? [y/N] ' >&2
       a=''
       read -r a || a=''
@@ -585,17 +586,13 @@ run_vacuum() {
 
 # fallback when the database filesystem is too small: write the compacted copy
 # to the backup target and copy it back over the database. "cp" truncates its
-# target first, so only the size of the compacted copy is needed locally – the
-# verified copy on the backup target stays until the local one passed its check.
+# target first, so the old file is freed before the compacted copy is written –
+# locally only what exceeds file_b + avail is missing. The verified copy on the
+# backup target stays until the local one passed its check.
 run_vacuum_remote() {
-  local file_b=$1 avail=$2 dest navail chk after
+  local file_b=$1 avail=$2 dest navail chk after csize extra
   dest="$BACKUP/vacuum-$(date +%Y%m%d-%H%M%S).db"
 
-  if [[ "${avail:-0}" -lt "$file_b" ]]; then
-    printf '  Not enough free space locally for the compacted copy (up to %s, %s free).\n' \
-      "$(fmt_b "$file_b")" "$(fmt_b "$avail")" >&2
-    return 1
-  fi
   navail=$(oc_free_bytes "$BACKUP")
   if [[ "${navail:-0}" -lt "$file_b" ]]; then
     printf '  Not enough free space at %s: %s needed, %s free.\n' \
@@ -620,6 +617,21 @@ run_vacuum_remote() {
     return 1
   fi
   echo ok
+
+  # cp truncates the database first: the space it occupies becomes free, so only
+  # a compacted copy bigger than file_b + avail would not fit
+  csize=$(stat -c%s "$dest")
+  extra=$(( csize > file_b ? csize - file_b : 0 ))
+  if (( extra > avail )); then
+    printf '  Not enough free space locally: the compacted copy is %s, the old\n' \
+      "$(fmt_b "$csize")" >&2
+    printf '  file frees %s and %s is free – %s short.\n' \
+      "$(fmt_b "$file_b")" "$(fmt_b "$avail")" \
+      "$(fmt_b "$(( extra - avail ))")" >&2
+    printf '  Database untouched. The verified copy stays at:\n  %s\n' "$dest" >&2
+    printf '  free the space, then: cp %s %s\n' "$dest" "$DB" >&2
+    return 1
+  fi
 
   printf '  copying it back over %s … ' "$(basename "$DB")"
   if ! cp -f "$dest" "$DB"; then

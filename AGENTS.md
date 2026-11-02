@@ -33,7 +33,10 @@ logic into the lib instead of duplicating it.
   free) and `run_vacuum_remote` (into `$BACKUP`, then `cp` over the database – used
   only when a terminal answered `y` to the question about the missing space). The
   question is asked **only** with `--vacuum` and only when stdin is a terminal;
-  `OC_PROMPT=1` forces it for tests.
+  `OC_PROMPT=1` forces it for tests. The remote route must **not** require the
+  uncompressed file size locally: `cp` truncates the database first, so its local
+  check uses the actual compacted size after `VACUUM INTO` (`compacted ≤ file + free`)
+  and aborts with the verified `$BACKUP` copy left in place if even that does not fit.
 - **`--vacuum` is backup-first**: `run_backup` runs before `run_apply` in both entry
   scripts, so a copy exists before anything is deleted or rewritten. It needs the
   directory `$BACKUP` to already exist (a not mounted path would silently write to `/`)
@@ -136,6 +139,13 @@ OC_PROMPT=1 bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }
 #         copy back, integrity ok, temporary copy removed
 # <<< n  -> "Aborted – nothing was changed", database unchanged
 # without OC_PROMPT and stdin < /dev/null -> "Free space first", exit 1
+
+# local check after VACUUM INTO: pass file_b too small so extra > avail
+bash -c 'source ./oc-lib.sh; pgrep(){ return 1; }
+  BACKUP=/tmp/oc-vac-test/bk; DB=/tmp/oc-vac-test/test.db
+  run_vacuum_remote 1000 0'
+# expect: "Not enough free space locally … Database untouched", exit 1,
+#         database unchanged, verified vacuum-<ts>.db left in $BACKUP
 ```
 
 To check target lists without deleting (no `opencode` call, no DB write): run the jq line
