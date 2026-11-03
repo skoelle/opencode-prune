@@ -46,10 +46,10 @@ logic into the lib instead of duplicating it.
   network target that takes about as long as the copy, so keep the progress line
   announced before it. With `BACKUP_REMOTE` the raw database is checkpointed, streamed
   with `rsync` (no local copy) and verified with `sha256sum` on both sides; the remote
-  directory must already exist and have the database size free. `run_vacuum` in turn
-  **aborts unless the database filesystem has 2× the file size free** – keep those
-  rules when touching either function, and document them in the README command
-  reference.
+  directory must already exist, be writable by the SSH user and have the database size
+  free. `run_vacuum` in turn **aborts unless the database filesystem has 2× the file
+  size free** – keep those rules when touching either function, and document them in
+  the README command reference.
 - **`BACKUP_REMOTE` is only for the full backup before `--vacuum`.** Exports still go
   to `$BACKUP`. The format is `[user@]host:/absolute/path` (simple ASCII, no spaces,
   colons or shell metacharacters in the path). SSH runs with `BatchMode=yes`, so keys

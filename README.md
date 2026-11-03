@@ -121,9 +121,10 @@ that differ. Steps in **bold** are the ones that change something.
      size compared with the original → `PRAGMA integrity_check` on the copy.
      That check reads the whole copy **again**; on a network target it can take as
      long as the copy itself, so the run announces it with a progress line
-   - with `BACKUP_REMOTE`: the remote directory must exist and have at least the
-     database size free → `PRAGMA wal_checkpoint(TRUNCATE)` must leave an empty
-     WAL → `PRAGMA integrity_check` on the database → `rsync` streams the raw
+   - with `BACKUP_REMOTE`: the remote directory must exist, be writable by the
+     SSH user and have at least the database size free →
+     `PRAGMA wal_checkpoint(TRUNCATE)` must leave an empty WAL →
+     `PRAGMA integrity_check` on the database → `rsync` streams the raw
      file to `host:path/opencode-<timestamp>.db` (no local copy) → `sha256sum`
      is compared on both sides
 3. **space check**: the filesystem of the database must have at least **2×** the file
@@ -391,8 +392,8 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 - 🔑 read access to the database (`--vacuum` needs write access to it)
 - 📐 `df`, `stat`, `pgrep` (standard coreutils / procps)
 - 🛰️ with `BACKUP_REMOTE`: `ssh` with key auth (`BatchMode=yes`), `rsync` and
-  `sha256sum` on the remote, and an existing remote directory; `sqlite3` on the
-  remote is **not** required
+  `sha256sum` on the remote, and an existing remote directory that is writable by
+  the SSH user; `sqlite3` on the remote is **not** required
 
 ---
 
@@ -407,7 +408,7 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we **reserve 2×** (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
 | ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
 | 📡 writing the backup onto an unmounted path would silently fill `/` | `$BACKUP` must already exist, otherwise the run stops before copying anything |
-| 🛰️ remote backup target unreachable or missing | `--vacuum` aborts before the checkpoint; create the directory and set up key-based SSH (`ssh-copy-id`, `BatchMode=yes`) |
+| 🛰️ remote backup target unreachable or missing | `--vacuum` aborts before the checkpoint; create the directory, make it writable by the SSH user and set up key-based SSH (`ssh-copy-id`, `BatchMode=yes`) |
 | 🧪 a raw `cp`/`rsync` of the database with a non-empty WAL is not a consistent snapshot | the remote route checkpoints the WAL first and verifies the database; with `--no-backup` you are responsible for a consistent backup yourself |
 | 📉 the disk is too small for the 2× reserve (typical for a big database) | in a terminal `--vacuum` asks whether to compact via `$BACKUP` instead; scripts abort and have to free space themselves |
 

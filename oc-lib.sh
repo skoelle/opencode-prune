@@ -364,6 +364,13 @@ backup_remote_parse() {
   if [[ "$OC_RPATH" != "/" ]]; then OC_RPATH=${OC_RPATH%/}; fi
 }
 
+# run a single command string on the remote. ssh joins its arguments with
+# spaces, so a separate "sh -c '…' _ path" would lose the quoting; the parser
+# restricts the path to safe ASCII, therefore single quotes are enough.
+backup_remote_cmd() {
+  ssh -o BatchMode=yes -- "$OC_RHOST" "$1"
+}
+
 # remote backup: checkpoint the WAL, then stream the raw database with rsync –
 # no local copy is created. Only used by --vacuum, where the database may be
 # opened writable anyway.
@@ -379,15 +386,20 @@ run_backup_remote() {
   printf '  to %s:%s (ssh) | size %s\n' \
     "$OC_RHOST" "$OC_RPATH" "$(fmt_b "$file_b")"
 
-  if ! ssh -o BatchMode=yes -- "$OC_RHOST" sh -c 'test -d "$1"' _ "$OC_RPATH"; then
+  if ! backup_remote_cmd "test -d '$OC_RPATH'"; then
     printf '  Remote backup directory missing or host unreachable: %s:%s\n' \
       "$OC_RHOST" "$OC_RPATH" >&2
     printf '  Create it (and mount its filesystem) first.\n' >&2
     return 1
   fi
+  if ! backup_remote_cmd "test -w '$OC_RPATH'"; then
+    printf '  Remote backup directory is not writable by the SSH user: %s:%s\n' \
+      "$OC_RHOST" "$OC_RPATH" >&2
+    printf '  Fix the ownership/permissions on the remote first.\n' >&2
+    return 1
+  fi
 
-  if ! avail=$(ssh -o BatchMode=yes -- "$OC_RHOST" \
-       sh -c 'df -B1 --output=avail "$1"' _ "$OC_RPATH"); then
+  if ! avail=$(backup_remote_cmd "df -B1 --output=avail '$OC_RPATH'"); then
     printf '  Cannot query free space on %s.\n' "$OC_RHOST" >&2
     return 1
   fi
@@ -404,8 +416,7 @@ run_backup_remote() {
     return 1
   fi
 
-  if ! ssh -o BatchMode=yes -- "$OC_RHOST" \
-       sh -c 'command -v rsync >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1'; then
+  if ! backup_remote_cmd 'command -v rsync >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1'; then
     printf '  rsync and sha256sum are required on %s.\n' "$OC_RHOST" >&2
     return 1
   fi
@@ -420,7 +431,7 @@ run_backup_remote() {
 
   sum_local=$(sha256sum -- "$DB" | awk '{print $1}')
   dest="$OC_RPATH/opencode-$(date +%Y%m%d-%H%M%S).db"
-  if ssh -o BatchMode=yes -- "$OC_RHOST" sh -c 'test -e "$1"' _ "$dest"; then
+  if backup_remote_cmd "test -e '$dest'"; then
     printf '  Refusing: %s:%s already exists – run again in a second.\n' \
       "$OC_RHOST" "$dest" >&2
     return 1
@@ -431,13 +442,11 @@ run_backup_remote() {
   if ! rsync -e 'ssh -o BatchMode=yes' --times --whole-file --protect-args \
        --info=progress2 -- "$DB" "$OC_RHOST:$dest" >&2; then
     printf 'FAILED – removing the partial remote file.\n' >&2
-    ssh -o BatchMode=yes -- "$OC_RHOST" \
-      sh -c 'rm -f "$1" "$1-wal" "$1-shm"' _ "$dest" 2>/dev/null || true
+    backup_remote_cmd "rm -f '$dest' '$dest-wal' '$dest-shm'" 2>/dev/null || true
     return 1
   fi
 
-  if ! sum_out=$(ssh -o BatchMode=yes -- "$OC_RHOST" \
-       sh -c 'sha256sum "$1"' _ "$dest"); then
+  if ! sum_out=$(backup_remote_cmd "sha256sum '$dest'"); then
     printf '  Cannot read the checksum of the remote copy.\n' >&2
     return 1
   fi
