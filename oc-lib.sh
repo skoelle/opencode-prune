@@ -17,6 +17,9 @@ OC_T_MSG=0
 OC_T_SES=0
 OC_ORPH_N=0
 OC_ORPH_B=0
+OC_VAC_LIVE=0
+OC_VAC_MARGIN=0
+OC_VAC_NEED=0
 
 # read .env first (only variables that are still unset), then apply defaults
 oc_init() {
@@ -67,7 +70,7 @@ Usage: $0 [--apply] [--vacuum] [--no-backup]
   (no option)   dry run: report + table, nothing is modified
   --apply       export each session to \$BACKUP, then delete it
   --vacuum      full backup of the database, then compact it
-                (opencode must be closed, needs twice the database size free;
+                (opencode must be closed, needs the expected compacted size free;
                 in a terminal it can compact via \$BACKUP if the disk is too small)
   --no-backup   with --vacuum: compact without the backup copy
 
@@ -635,7 +638,22 @@ vacuum_prepare() {
 
 # compact the database – the only place where it is opened writable.
 # VACUUM INTO instead of a plain VACUUM: a plain VACUUM needs up to twice the
-# file size as free space, VACUUM INTO only needs the compacted copy.
+# file size as free space, VACUUM INTO only needs the compacted copy. The check
+# below therefore reserves the expected compacted size (live pages + margin).
+
+# expected size of the compacted copy: live pages plus a safety margin
+vacuum_need() {
+  local prg pages psize freelist
+  prg=$(sql "SELECT page_count||'|'||page_size||'|'||freelist_count
+             FROM pragma_page_count, pragma_page_size, pragma_freelist_count;") || prg=''
+  [[ -n "$prg" ]] || return 1
+  IFS='|' read -r pages psize freelist <<< "$prg"
+  OC_VAC_LIVE=$(( (${pages:-0} - ${freelist:-0}) * ${psize:-0} ))
+  OC_VAC_MARGIN=$(( OC_VAC_LIVE / 10 ))
+  (( OC_VAC_MARGIN < 268435456 )) && OC_VAC_MARGIN=268435456
+  OC_VAC_NEED=$(( OC_VAC_LIVE + OC_VAC_MARGIN ))
+}
+
 run_vacuum() {
   printf '\nVacuum:\n'
   if ! db_readable; then
@@ -647,17 +665,24 @@ run_vacuum() {
 
   local file_b avail tmp chk after need a
   file_b=$(stat -c%s "$DB")
-  need=$(( file_b * 2 ))
   avail=$(oc_free_bytes "$(dirname "$DB")")
   tmp="$DB.vac"
 
-  printf '  before %s | free on disk %s | reserve %s\n' \
-    "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")" "$(fmt_b "$need")"
+  vacuum_need || {
+    printf '  Cannot read the database page counts – aborting.\n' >&2
+    return 1
+  }
+  need=$OC_VAC_NEED
+
+  printf '  before %s | free on disk %s | expected compacted ~%s | reserve %s\n' \
+    "$(fmt_b "$file_b")" "$(fmt_b "${avail:-0}")" \
+    "$(fmt_b "$OC_VAC_LIVE")" "$(fmt_b "$need")"
 
   if [[ "${avail:-0}" -lt "$need" ]]; then
-    printf '  Not enough free space for the normal route: a vacuum can need up to\n' >&2
-    printf '  twice the file size (%s), only %s is free.\n' \
-      "$(fmt_b "$need")" "$(fmt_b "${avail:-0}")" >&2
+    printf '  The expected compacted copy (~%s + margin = %s) does not fit:\n' \
+      "$(fmt_b "$OC_VAC_LIVE")" "$(fmt_b "$need")" >&2
+    printf '  only %s is free on the database filesystem.\n' \
+      "$(fmt_b "${avail:-0}")" >&2
     # only --vacuum ever gets here, and only a terminal is asked – scripted
     # runs must free the space themselves (OC_PROMPT=1 forces the question)
     if [[ -t 0 || "${OC_PROMPT:-}" == "1" ]] && [[ -d "$BACKUP" ]]; then
@@ -690,7 +715,12 @@ run_vacuum() {
   vacuum_prepare || return 1
 
   printf '  VACUUM INTO %s … ' "$(basename "$tmp")"
-  sqlw "VACUUM INTO '$tmp';" >/dev/null
+  if ! sqlw "VACUUM INTO '$tmp';" >/dev/null; then
+    printf 'FAILED\n' >&2
+    rm -f "$tmp"
+    printf '  Original database untouched. Free space or use the backup target route.\n' >&2
+    return 1
+  fi
   echo done
 
   chk=$(sqlite3 -readonly "$tmp" 'PRAGMA integrity_check;') || chk=''

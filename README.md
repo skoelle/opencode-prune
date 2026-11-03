@@ -127,8 +127,9 @@ that differ. Steps in **bold** are the ones that change something.
      `PRAGMA integrity_check` on the database → `rsync` streams the raw
      file to `host:path/opencode-<timestamp>.db` (no local copy) → `sha256sum`
      is compared on both sides
-3. **space check**: the filesystem of the database must have at least **2×** the file
-   size free (a plain `VACUUM` can need that much), otherwise abort
+3. **space check**: the filesystem of the database must have the **expected compacted
+   size** (live pages + a safety margin: 10 %, at least 256 MiB) free – not 2× the
+   file size, because we use `VACUUM INTO`; otherwise abort
 4. **if that check fails and a terminal is attached**: the question
    `Do it via the backup target? [y/N]` – on `y` the compacted copy is written to
    `$BACKUP` and copied back over the database ([details](#when-the-disk-is-too-small)),
@@ -257,10 +258,12 @@ The exact step list of every command is in
   (`opencode-<timestamp>.db`, copied with the read-only backup API) or, if
   `BACKUP_REMOTE` is set, uploaded to the SSH target with `rsync` after a
   checkpoint (no local temporary copy)
-- 📏 it **aborts** unless the database filesystem has **2×** the file size free
+- 📏 it **aborts** unless the database filesystem has the **expected compacted size**
+  (live pages + a safety margin: 10 %, at least 256 MiB) free – a plain `VACUUM` would
+  need 2×, `VACUUM INTO` only needs the copy
 - 🗜️ it compacts with `VACUUM INTO` and only swaps the file in after the copy
   passed an `integrity_check`
-- 💬 in a terminal it **asks** when the disk is too small for the 2× reserve –
+- 💬 in a terminal it **asks** when the expected compacted copy does not fit –
   the backup-target route then needs only the actual compacted size (the old file
   is freed first), see the next section
 
@@ -284,16 +287,18 @@ Backup:
 
 ### When the disk is too small
 
-Sometimes the disk simply cannot hold the reserve (a 5 GiB database on a disk with
-5.5 GiB free is the typical case). In a terminal `--vacuum` then asks:
+Sometimes the compacted copy does not fit even though it is much smaller than the
+original (a 5 GiB database on a disk with 3.2 GiB free is the typical case). In a
+terminal `--vacuum` then asks:
 
 ```
-  Not enough free space for the normal route: a vacuum can need up to
-  twice the file size (10.83 GiB), only 5.47 GiB is free.
+  before 5.00 GiB | free on disk 3.20 GiB | expected compacted ~3.60 GiB | reserve 3.96 GiB
+  The expected compacted copy (~3.60 GiB + margin = 3.96 GiB) does not fit:
+  only 3.20 GiB is free on the database filesystem.
   Compact via /mnt/backup/opencode instead: the compacted copy travels over the
   network and is copied over the database, which frees the old file
   first. It fits locally as long as the compacted copy is at most
-  10.88 GiB (old file + 5.47 GiB free).
+  8.20 GiB (old file + 3.20 GiB free).
   Do it via the backup target? [y/N]
 ```
 
@@ -301,8 +306,8 @@ On `y` the route is: checkpoint → `integrity_check` → `VACUUM INTO $BACKUP/v
 → `integrity_check` on that copy → check its **actual** size against
 `old file + free space` → `cp` it over the database (which frees the old pages first)
 → `integrity_check` again → remove the temporary copy. The local peak is the size of
-the **compacted** copy instead of 2× the original – which is exactly the space that
-was missing. If even that does not fit, the database stays untouched and the verified
+the **compacted** copy, not old file + copy – which is exactly the space that was
+missing. If even that does not fit, the database stays untouched and the verified
 copy stays on the backup target (`cp $BACKUP/vacuum-<ts>.db …` once space is free).
 On `n` (or without a terminal, e.g. in a script) the run stops and nothing is changed.
 
@@ -324,7 +329,7 @@ deleting [1/267] ses_… (/home/user/projects/legacy-tool) … deleted
 Freelist after delete: 1.33 GiB – the file itself does not shrink
 
 Vacuum:
-  before 4.59 GiB | free on disk 9.54 GiB | reserve 9.18 GiB
+  before 4.59 GiB | free on disk 9.54 GiB | expected compacted ~3.26 GiB | reserve 3.59 GiB
   integrity check … ok
   VACUUM INTO opencode.db.vac … done
   after  3.26 GiB (freed 1.33 GiB)
@@ -336,7 +341,7 @@ Vacuum:
 |---|---|---|
 | 💿 Worst case free space | up to **2×** the file size | only the **compacted copy** |
 | 🛟 If it fails halfway | original already rewritten | original untouched until the swap |
-| 📏 What we reserve | **2×** – we check for it and abort early | same rule, so the worst case is covered |
+| 📏 What we reserve | **2×** – a plain `VACUUM` needs it | the **expected compacted size** (live pages + margin) |
 
 ### How much is really left?
 
@@ -405,12 +410,12 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 🚫 `GROUP BY 1` with aggregates in the same select list is forbidden in SQLite | `GROUP BY <column>` |
 | 📤 Progress messages on stdout corrupt `SESSIONS=$(…)` | print them with `printf … >&2` |
 | 🎯 `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line (`…/opencode-prune/…`) | `pgrep -x opencode` |
-| 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we **reserve 2×** (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
+| 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we reserve the expected compacted size (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
 | ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
 | 📡 writing the backup onto an unmounted path would silently fill `/` | `$BACKUP` must already exist, otherwise the run stops before copying anything |
 | 🛰️ remote backup target unreachable or missing | `--vacuum` aborts before the checkpoint; create the directory, make it writable by the SSH user and set up key-based SSH (`ssh-copy-id`, `BatchMode=yes`) |
 | 🧪 a raw `cp`/`rsync` of the database with a non-empty WAL is not a consistent snapshot | the remote route checkpoints the WAL first and verifies the database; with `--no-backup` you are responsible for a consistent backup yourself |
-| 📉 the disk is too small for the 2× reserve (typical for a big database) | in a terminal `--vacuum` asks whether to compact via `$BACKUP` instead; scripts abort and have to free space themselves |
+| 📉 the disk is too small for the expected compacted copy (typical for a big database) | in a terminal `--vacuum` asks whether to compact via `$BACKUP` instead; scripts abort and have to free space themselves |
 
 ---
 

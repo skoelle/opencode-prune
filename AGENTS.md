@@ -9,7 +9,7 @@ names, IDs or credentials may be committed (`.env` is gitignored for that reason
 
 | File | Contents |
 |---|---|
-| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup` (+ `run_backup_remote`, `backup_remote_parse`), `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
+| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup` (+ `run_backup_remote`, `backup_remote_parse`), `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `vacuum_need`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
 | `oc-prune.sh` | scan with `opencode session list` per directory, progress on stderr |
 | `oc-prune-db.sh` | scan with one `SELECT` (fast, complete) |
 | `.env` | local configuration; precedence: environment variable → `.env` → default |
@@ -30,14 +30,15 @@ logic into the lib instead of duplicating it.
   `~/.cache/oc-prune/`, only `$BACKUP` (exports/local backup) and `$BACKUP_REMOTE`
   (full database backup) are written to.
 - **`run_vacuum` has two routes**, both writing only through `sqlw` + `mv`/`cp`: the
-  normal one (`VACUUM INTO '$DB.vac'` next to the database, needs 2× the file size
-  free) and `run_vacuum_remote` (into `$BACKUP`, then `cp` over the database – used
-  only when a terminal answered `y` to the question about the missing space). The
-  question is asked **only** with `--vacuum` and only when stdin is a terminal;
-  `OC_PROMPT=1` forces it for tests. The remote route must **not** require the
-  uncompressed file size locally: `cp` truncates the database first, so its local
-  check uses the actual compacted size after `VACUUM INTO` (`compacted ≤ file + free`)
-  and aborts with the verified `$BACKUP` copy left in place if even that does not fit.
+  normal one (`VACUUM INTO '$DB.vac'` next to the database, needs the expected
+  compacted size – live pages + 10 % margin, at least 256 MiB – free) and
+  `run_vacuum_remote` (into `$BACKUP`, then `cp` over the database – used only when
+  a terminal answered `y` to the question about the missing space). The question is
+  asked **only** with `--vacuum` and only when stdin is a terminal; `OC_PROMPT=1`
+  forces it for tests. The remote route must **not** require the uncompressed file
+  size locally: `cp` truncates the database first, so its local check uses the actual
+  compacted size after `VACUUM INTO` (`compacted ≤ file + free`) and aborts with the
+  verified `$BACKUP` copy left in place if even that does not fit.
 - **`--vacuum` is backup-first**: `run_backup` runs before `run_apply` in both entry
   scripts, so a copy exists before anything is deleted or rewritten. Without
   `BACKUP_REMOTE` it needs the directory `$BACKUP` to already exist (a not mounted path
@@ -47,9 +48,9 @@ logic into the lib instead of duplicating it.
   announced before it. With `BACKUP_REMOTE` the raw database is checkpointed, streamed
   with `rsync` (no local copy) and verified with `sha256sum` on both sides; the remote
   directory must already exist, be writable by the SSH user and have the database size
-  free. `run_vacuum` in turn **aborts unless the database filesystem has 2× the file
-  size free** – keep those rules when touching either function, and document them in
-  the README command reference.
+  free. `run_vacuum` in turn **aborts unless the database filesystem has the expected
+  compacted size (live pages + margin: 10 %, min. 256 MiB) free** – keep those rules
+  when touching either function, and document them in the README command reference.
 - **`BACKUP_REMOTE` is only for the full backup before `--vacuum`.** Exports still go
   to `$BACKUP`. The format is `[user@]host:/absolute/path` (simple ASCII, no spaces,
   colons or shell metacharacters in the path). SSH runs with `BatchMode=yes`, so keys
