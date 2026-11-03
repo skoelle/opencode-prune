@@ -9,7 +9,7 @@ names, IDs or credentials may be committed (`.env` is gitignored for that reason
 
 | File | Contents |
 |---|---|
-| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup`, `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
+| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup` (+ `run_backup_remote`, `backup_remote_parse`), `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
 | `oc-prune.sh` | scan with `opencode session list` per directory, progress on stderr |
 | `oc-prune-db.sh` | scan with one `SELECT` (fast, complete) |
 | `.env` | local configuration; precedence: environment variable → `.env` → default |
@@ -21,13 +21,14 @@ logic into the lib instead of duplicating it.
 
 ## Rules
 
-- **Read the opencode database with `sqlite3 -readonly`.** The single exception is
-  `run_vacuum` (`--vacuum`): only there may the database be opened writable, for
-  `PRAGMA wal_checkpoint(TRUNCATE)`, `PRAGMA integrity_check`, `VACUUM INTO` and the
-  swap (including removal of the stale `-wal`/`-shm`). Every other path stays readonly –
-  including `run_backup`, which copies with the read-only backup API
-  (`sqlite3 -readonly "$DB" ".backup …"`). Besides our size cache under
-  `~/.cache/oc-prune/`, only `$BACKUP` is ever written to.
+- **Read the opencode database with `sqlite3 -readonly`.** The only writable path is
+  `--vacuum`: `run_vacuum` uses `PRAGMA wal_checkpoint(TRUNCATE)`,
+  `PRAGMA integrity_check`, `VACUUM INTO` and the swap (including removal of the stale
+  `-wal`/`-shm`), and `run_backup` uses the checkpoint only when `BACKUP_REMOTE` is set
+  (the raw `rsync` snapshot needs an empty WAL). Without `BACKUP_REMOTE`, `run_backup`
+  stays read-only (`sqlite3 -readonly "$DB" ".backup …"`). Besides our size cache under
+  `~/.cache/oc-prune/`, only `$BACKUP` (exports/local backup) and `$BACKUP_REMOTE`
+  (full database backup) are written to.
 - **`run_vacuum` has two routes**, both writing only through `sqlw` + `mv`/`cp`: the
   normal one (`VACUUM INTO '$DB.vac'` next to the database, needs 2× the file size
   free) and `run_vacuum_remote` (into `$BACKUP`, then `cp` over the database – used
@@ -38,11 +39,23 @@ logic into the lib instead of duplicating it.
   check uses the actual compacted size after `VACUUM INTO` (`compacted ≤ file + free`)
   and aborts with the verified `$BACKUP` copy left in place if even that does not fit.
 - **`--vacuum` is backup-first**: `run_backup` runs before `run_apply` in both entry
-  scripts, so a copy exists before anything is deleted or rewritten. It needs the
-  directory `$BACKUP` to already exist (a not mounted path would silently write to `/`)
-  and as much free space there as the database is big. `run_vacuum` in turn **aborts
-  unless the database filesystem has 2× the file size free** – keep those two rules
-  when touching either function, and document them in the README command reference.
+  scripts, so a copy exists before anything is deleted or rewritten. Without
+  `BACKUP_REMOTE` it needs the directory `$BACKUP` to already exist (a not mounted path
+  would silently write to `/`) and as much free space there as the database is big; the
+  copy is verified with `PRAGMA integrity_check`, which reads it **again** – on a
+  network target that takes about as long as the copy, so keep the progress line
+  announced before it. With `BACKUP_REMOTE` the raw database is checkpointed, streamed
+  with `rsync` (no local copy) and verified with `sha256sum` on both sides; the remote
+  directory must already exist and have the database size free. `run_vacuum` in turn
+  **aborts unless the database filesystem has 2× the file size free** – keep those
+  rules when touching either function, and document them in the README command
+  reference.
+- **`BACKUP_REMOTE` is only for the full backup before `--vacuum`.** Exports still go
+  to `$BACKUP`. The format is `[user@]host:/absolute/path` (simple ASCII, no spaces,
+  colons or shell metacharacters in the path). SSH runs with `BatchMode=yes`, so keys
+  must be set up. The remote needs `rsync` and `sha256sum`; `sqlite3` is not required
+  because the source is integrity-checked locally and the transfer is
+  checksum-verified.
 - **Never run `--apply` without explicit approval.** Verify with a dry run and by
   generating the target lists (see below). The same holds for `--vacuum` against the
   real database – it rewrites the file. Test vacuum mechanics on a copy in `/tmp`.
@@ -105,6 +118,24 @@ SIZES=0 ./oc-prune-db.sh                   # dry run without size computation (~
 SIZES=0 ./oc-prune-db.sh --vacuum          # must stop: "opencode is still running"
 ONLY=/path/to/project ./oc-prune-db.sh     # dry run limited to one directory
 ```
+
+`BACKUP_REMOTE` parsing without any network access:
+
+```bash
+bash -c 'source ./oc-lib.sh; BACKUP_REMOTE=user@host:/path/to/backup
+  backup_remote_parse; echo "$OC_RHOST|$OC_RPATH"'
+# expect: user@host|/path/to/backup
+bash -c 'source ./oc-lib.sh; BACKUP_REMOTE="user@host:relative"; backup_remote_parse'
+# expect: error "must be [user@]host:/absolute/path", exit 1
+bash -c 'source ./oc-lib.sh; BACKUP_REMOTE="user@host:/path with space"; backup_remote_parse'
+# expect: same error, exit 1
+```
+
+The actual remote flow is tested against the real target on a **copy** of the database
+in `/tmp` (never the real `$DB`): set `BACKUP_REMOTE=user@host:/tmp/oc-vac-test/remote`,
+`BACKUP` to a local directory, and run `run_backup` with `pgrep(){ return 1; }` and
+`OC_BACKUP=1 OC_VACUUM=1`; expect a timestamped `.db` on the remote, a matching
+`sha256sum`, and no local copy.
 
 Backup + vacuum mechanics on isolated copies (opencode faked as closed – never point
 this at the real `$DB`):

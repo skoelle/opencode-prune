@@ -10,6 +10,7 @@
 | 🗜️ Compact | `./oc-prune-db.sh --vacuum` – verified backup of the database, then compact it |
 | 🔒 Database | read-only (`sqlite3 -readonly`), the only exception is `--vacuum` |
 | 📦 Export | every session is exported to `BACKUP` **before** it is deleted |
+| 🛰️ Remote backup | with `BACKUP_REMOTE`, the full database copy before `--vacuum` goes over SSH/rsync |
 
 ---
 
@@ -114,9 +115,17 @@ that differ. Steps in **bold** are the ones that change something.
 
 1. 🛑 `pgrep -x opencode` – abort with code 1 while an instance runs
 2. **backup** (skipped with `--no-backup`):
-   `$BACKUP` must already exist and have at least the size of the database free →
-   `sqlite3 -readonly "$DB" ".backup '$BACKUP/opencode-<timestamp>.db'"` →
-   size compared with the original → `PRAGMA integrity_check` on the copy
+   - without `BACKUP_REMOTE`: `$BACKUP` must already exist and have at least the
+     size of the database free →
+     `sqlite3 -readonly "$DB" ".backup '$BACKUP/opencode-<timestamp>.db'"` →
+     size compared with the original → `PRAGMA integrity_check` on the copy.
+     That check reads the whole copy **again**; on a network target it can take as
+     long as the copy itself, so the run announces it with a progress line
+   - with `BACKUP_REMOTE`: the remote directory must exist and have at least the
+     database size free → `PRAGMA wal_checkpoint(TRUNCATE)` must leave an empty
+     WAL → `PRAGMA integrity_check` on the database → `rsync` streams the raw
+     file to `host:path/opencode-<timestamp>.db` (no local copy) → `sha256sum`
+     is compared on both sides
 3. **space check**: the filesystem of the database must have at least **2×** the file
    size free (a plain `VACUUM` can need that much), otherwise abort
 4. **if that check fails and a terminal is attached**: the question
@@ -145,6 +154,8 @@ that differ. Steps in **bold** are the ones that change something.
 
 > ❗ The backup and the compaction always cover the **whole database** – `ONLY` has no
 > influence on them. `ONLY` only limits which sessions are shown, exported and deleted.
+> With `BACKUP_REMOTE` the full backup goes over SSH; `$BACKUP` is then only used for
+> the exports of deleted sessions.
 
 ---
 
@@ -170,14 +181,15 @@ by `oc_augment_missing` in both scripts.
 ## ⚙️ Configuration
 
 **Precedence: environment variable → `.env` → default.** Read as `ROOT`, `DAYS`, `MIN`,
-`BACKUP`, `DB`, `ONLY`, `SIZES`, `SIZE_CACHE`.
+`BACKUP`, `BACKUP_REMOTE`, `DB`, `ONLY`, `SIZES`, `SIZE_CACHE`.
 
 | Variable | 🟢 Default | 📝 Meaning |
 |---|---|---|
 | `ROOT` | `$HOME/Code` | root that gets scanned; rows outside get `outside` |
 | `DAYS` | `30` | sessions older than that are candidates for deletion |
 | `MIN` | `3` | this many youngest sessions stay per directory |
-| `BACKUP` | `$HOME/opencode-export` | receives the exports of deleted sessions **and** (with `--vacuum`) the full database copy `opencode-<timestamp>.db`; the directory must already exist |
+| `BACKUP` | `$HOME/opencode-export` | receives the exports of deleted sessions **and** (with `--vacuum`, if no `BACKUP_REMOTE`) the full database copy `opencode-<timestamp>.db`; the directory must already exist |
+| `BACKUP_REMOTE` | *(empty)* | `[user@]host:/absolute/path` – with `--vacuum` the full database copy is uploaded there via `ssh`/`rsync` instead of `$BACKUP` (no local temporary copy); exports still go to `$BACKUP` |
 | `DB` | `~/.local/share/opencode/opencode.db` | opencode database |
 | `ONLY` | *(empty)* | work on this directory (and everything below) only |
 | `SIZES` | `1` | `0` skips the size computation (the `MB` column stays `-`) |
@@ -188,6 +200,7 @@ by `oc_augment_missing` in both scripts.
 
 ```
 BACKUP=$HOME/opencode-export
+#BACKUP_REMOTE=user@host:/path/to/backup
 #ONLY=/home/user/projects/demo-app
 ```
 
@@ -239,14 +252,34 @@ it.
 The exact step list of every command is in
 [🧭 Command reference](#-command-reference); the essentials of `--vacuum`:
 
-- 💾 it starts with a **verified full copy** of the database in `$BACKUP`
-  (`opencode-<timestamp>.db`, copied with the read-only backup API)
+- 💾 it starts with a **verified full copy** of the database – in `$BACKUP`
+  (`opencode-<timestamp>.db`, copied with the read-only backup API) or, if
+  `BACKUP_REMOTE` is set, uploaded to the SSH target with `rsync` after a
+  checkpoint (no local temporary copy)
 - 📏 it **aborts** unless the database filesystem has **2×** the file size free
 - 🗜️ it compacts with `VACUUM INTO` and only swaps the file in after the copy
   passed an `integrity_check`
 - 💬 in a terminal it **asks** when the disk is too small for the 2× reserve –
   the backup-target route then needs only the actual compacted size (the old file
   is freed first), see the next section
+
+With `BACKUP_REMOTE` the backup step looks like this (the SSH host is only an
+example):
+
+```
+Backup:
+  to user@host:/path/to/backup (ssh) | size 4.59 GiB
+  free there 9.49 TiB
+  integrity check … ok
+  uploading (4.59 GiB) …
+  user@host:/path/to/backup/opencode-20261014-221530.db (sha256 ok, 96s)
+```
+
+> 💡 The remote route needs key-based SSH (`BatchMode=yes`), `rsync` and
+> `sha256sum` on the remote. `sqlite3` is **not** required there: the database is
+> integrity-checked locally before the upload and the transfer is verified with
+> `sha256sum` on both sides. The SSH target must be a simple ASCII path (no spaces,
+> colons or shell metacharacters).
 
 ### When the disk is too small
 
@@ -282,6 +315,7 @@ What the tail of a full run looks like:
 Backup:
   to /mnt/backup/opencode | size 4.59 GiB | free there 9.49 TiB
   copying … done
+  integrity check of the copy (reads the whole backup again) … ok
   /mnt/backup/opencode/opencode-20261014-221530.db (integrity ok, 96s)
 Export to: /mnt/backup/opencode
 deleting [1/267] ses_… (/home/user/projects/legacy-tool) … deleted
@@ -330,10 +364,12 @@ events store a **full snapshot on every update** (114k snapshots of 31.5k messag
 ## 🗄️ Database access
 
 Every report, scan and table uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`),
-and so does the backup copy (`sqlite3 -readonly "$DB" ".backup …"`). The **one
-exception is `--vacuum`**, which opens the database writable for the checkpoint and
-the `VACUUM INTO` – nothing else ever writes to it. Besides our own size cache under
-`~/.cache/oc-prune/` and the files under `$BACKUP` nothing else is created.
+and so does the local backup copy (`sqlite3 -readonly "$DB" ".backup …"`). The
+exception is the `--vacuum` path: `run_vacuum` opens the database writable for the
+checkpoint and the `VACUUM INTO`, and when `BACKUP_REMOTE` is set `run_backup` also
+opens it writable for the checkpoint that makes the raw `rsync` snapshot consistent.
+Besides our own size cache under `~/.cache/oc-prune/`, the files under `$BACKUP` and
+the backup on `$BACKUP_REMOTE`, nothing else is created.
 
 The `MB` values need a full scan of the `event` table (4 GiB, about 60 s) and are
 therefore cached; the key is `count/max(time_created)` so the cache stays valid while
@@ -354,6 +390,9 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 - 🤖 `opencode` in `PATH`
 - 🔑 read access to the database (`--vacuum` needs write access to it)
 - 📐 `df`, `stat`, `pgrep` (standard coreutils / procps)
+- 🛰️ with `BACKUP_REMOTE`: `ssh` with key auth (`BatchMode=yes`), `rsync` and
+  `sha256sum` on the remote, and an existing remote directory; `sqlite3` on the
+  remote is **not** required
 
 ---
 
@@ -368,6 +407,8 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we **reserve 2×** (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
 | ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
 | 📡 writing the backup onto an unmounted path would silently fill `/` | `$BACKUP` must already exist, otherwise the run stops before copying anything |
+| 🛰️ remote backup target unreachable or missing | `--vacuum` aborts before the checkpoint; create the directory and set up key-based SSH (`ssh-copy-id`, `BatchMode=yes`) |
+| 🧪 a raw `cp`/`rsync` of the database with a non-empty WAL is not a consistent snapshot | the remote route checkpoints the WAL first and verifies the database; with `--no-backup` you are responsible for a consistent backup yourself |
 | 📉 the disk is too small for the 2× reserve (typical for a big database) | in a terminal `--vacuum` asks whether to compact via `$BACKUP` instead; scripts abort and have to free space themselves |
 
 ---

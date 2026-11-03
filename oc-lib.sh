@@ -1,8 +1,9 @@
 # oc-lib.sh – shared reporting and deletion logic for oc-prune.sh / oc-prune-db.sh
-# The opencode database is only read with "sqlite3 -readonly" – one exception:
-# run_vacuum (--vacuum) opens it writable for the checkpoint and VACUUM INTO.
-# run_backup uses the read-only backup API (".backup") and writes only to $BACKUP.
-# Otherwise nothing is written except our own size cache.
+# The opencode database is only read with "sqlite3 -readonly" – the exception is
+# the --vacuum path: run_vacuum opens it writable for the checkpoint and
+# VACUUM INTO, and run_backup does the same checkpoint when BACKUP_REMOTE is set
+# (raw rsync copy). Writes go to $BACKUP (exports/local backup) and
+# $BACKUP_REMOTE (full database backup); otherwise only our size cache is written.
 
 declare -a OC_MISSING_DIRS=()
 APPLY=0
@@ -27,6 +28,7 @@ oc_init() {
   DAYS=${DAYS:-30}
   MIN=${MIN:-3}
   BACKUP=${BACKUP:-$HOME/opencode-export}
+  BACKUP_REMOTE=${BACKUP_REMOTE:-}
   DB=${DB:-$HOME/.local/share/opencode/opencode.db}
   ONLY=${ONLY:-}
   SIZE_CACHE=${SIZE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/oc-prune/db-data.tsv}
@@ -46,7 +48,7 @@ load_env() {
     if [[ "$v" == \"*\" ]]; then v=${v:1:-1}; fi
     if [[ "$v" == \'*\' ]]; then v=${v:1:-1}; fi
     case "$k" in
-      ROOT|DAYS|MIN|BACKUP|DB|ONLY|SIZES|SIZE_CACHE)
+      ROOT|DAYS|MIN|BACKUP|BACKUP_REMOTE|DB|ONLY|SIZES|SIZE_CACHE)
         if [[ -z "${!k:-}" ]]; then printf -v "$k" '%s' "$v"; fi ;;
     esac
   done < "$f"
@@ -64,13 +66,16 @@ Usage: $0 [--apply] [--vacuum] [--no-backup]
 
   (no option)   dry run: report + table, nothing is modified
   --apply       export each session to \$BACKUP, then delete it
-  --vacuum      full backup of the database to \$BACKUP, then compact it
+  --vacuum      full backup of the database, then compact it
                 (opencode must be closed, needs twice the database size free;
                 in a terminal it can compact via \$BACKUP if the disk is too small)
   --no-backup   with --vacuum: compact without the backup copy
 
+  BACKUP_REMOTE  [user@]host:/absolute/path – with --vacuum the full database
+                 copy is uploaded there via ssh/rsync instead of \$BACKUP
+
 Configuration: environment variable -> .env -> default
-  ROOT DAYS MIN BACKUP DB ONLY SIZES SIZE_CACHE
+  ROOT DAYS MIN BACKUP BACKUP_REMOTE DB ONLY SIZES SIZE_CACHE
 EOF
 }
 
@@ -344,9 +349,112 @@ print_table() {
     "${tot_n:-0}" "${tot_dirs:-0}" "${tot_k:-0}"
 }
 
-# full copy of the database to $BACKUP, verified – runs before anything
-# destructive. The source stays readonly; ".backup" copies through the backup
-# API and therefore yields a consistent snapshot even with a WAL present.
+# split BACKUP_REMOTE into host and absolute remote path. Only simple ASCII
+# characters are accepted: ssh/rsync would otherwise need another layer of
+# quoting for the remote shell.
+backup_remote_parse() {
+  local spec=${BACKUP_REMOTE:-}
+  if [[ ! "$spec" =~ ^([A-Za-z0-9._@-]+):(/[A-Za-z0-9._/+@%~,=-]*)$ ]]; then
+    printf '  BACKUP_REMOTE must be [user@]host:/absolute/path with simple ASCII characters (no spaces, colons or shell metacharacters): %s\n' \
+      "${spec:-<empty>}" >&2
+    return 1
+  fi
+  OC_RHOST=${BASH_REMATCH[1]}
+  OC_RPATH=${BASH_REMATCH[2]}
+  if [[ "$OC_RPATH" != "/" ]]; then OC_RPATH=${OC_RPATH%/}; fi
+}
+
+# remote backup: checkpoint the WAL, then stream the raw database with rsync –
+# no local copy is created. Only used by --vacuum, where the database may be
+# opened writable anyway.
+run_backup_remote() {
+  local file_b avail sum_local sum_remote sum_out dest t0
+  file_b=$(stat -c%s "$DB")
+
+  backup_remote_parse || return 1
+  if ! command -v ssh >/dev/null 2>&1 || ! command -v rsync >/dev/null 2>&1; then
+    printf '  ssh and rsync are required for BACKUP_REMOTE.\n' >&2
+    return 1
+  fi
+  printf '  to %s:%s (ssh) | size %s\n' \
+    "$OC_RHOST" "$OC_RPATH" "$(fmt_b "$file_b")"
+
+  if ! ssh -o BatchMode=yes -- "$OC_RHOST" sh -c 'test -d "$1"' _ "$OC_RPATH"; then
+    printf '  Remote backup directory missing or host unreachable: %s:%s\n' \
+      "$OC_RHOST" "$OC_RPATH" >&2
+    printf '  Create it (and mount its filesystem) first.\n' >&2
+    return 1
+  fi
+
+  if ! avail=$(ssh -o BatchMode=yes -- "$OC_RHOST" \
+       sh -c 'df -B1 --output=avail "$1"' _ "$OC_RPATH"); then
+    printf '  Cannot query free space on %s.\n' "$OC_RHOST" >&2
+    return 1
+  fi
+  avail=$(printf '%s\n' "$avail" | tail -n1 | tr -d '[:space:]')
+  if [[ ! "$avail" =~ ^[0-9]+$ ]]; then
+    printf '  Cannot parse free space on %s: %s\n' "$OC_RHOST" \
+      "${avail:-empty}" >&2
+    return 1
+  fi
+  printf '  free there %s\n' "$(fmt_b "$avail")"
+  if (( avail < file_b )); then
+    printf '  Not enough free space at the remote target: %s needed, %s free.\n' \
+      "$(fmt_b "$file_b")" "$(fmt_b "$avail")" >&2
+    return 1
+  fi
+
+  if ! ssh -o BatchMode=yes -- "$OC_RHOST" \
+       sh -c 'command -v rsync >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1'; then
+    printf '  rsync and sha256sum are required on %s.\n' "$OC_RHOST" >&2
+    return 1
+  fi
+
+  # rsync copies the raw file, so the WAL has to be empty for a consistent
+  # snapshot; this is the same checkpoint that run_vacuum would do later
+  vacuum_prepare || return 1
+  if [[ -f "$DB-wal" && "$(stat -c%s "$DB-wal")" -gt 0 ]]; then
+    printf '  WAL not empty after the integrity check – aborting.\n' >&2
+    return 1
+  fi
+
+  sum_local=$(sha256sum -- "$DB" | awk '{print $1}')
+  dest="$OC_RPATH/opencode-$(date +%Y%m%d-%H%M%S).db"
+  if ssh -o BatchMode=yes -- "$OC_RHOST" sh -c 'test -e "$1"' _ "$dest"; then
+    printf '  Refusing: %s:%s already exists – run again in a second.\n' \
+      "$OC_RHOST" "$dest" >&2
+    return 1
+  fi
+
+  t0=$(date +%s)
+  printf '  uploading (%s) …\n' "$(fmt_b "$file_b")"
+  if ! rsync -e 'ssh -o BatchMode=yes' --times --whole-file --protect-args \
+       --info=progress2 -- "$DB" "$OC_RHOST:$dest" >&2; then
+    printf 'FAILED – removing the partial remote file.\n' >&2
+    ssh -o BatchMode=yes -- "$OC_RHOST" \
+      sh -c 'rm -f "$1" "$1-wal" "$1-shm"' _ "$dest" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! sum_out=$(ssh -o BatchMode=yes -- "$OC_RHOST" \
+       sh -c 'sha256sum "$1"' _ "$dest"); then
+    printf '  Cannot read the checksum of the remote copy.\n' >&2
+    return 1
+  fi
+  sum_remote=$(printf '%s\n' "$sum_out" | awk '{print $1}')
+  if [[ "$sum_local" != "$sum_remote" ]]; then
+    printf '  checksum mismatch (local %s, remote %s) – aborting.\n' \
+      "$sum_local" "${sum_remote:-none}" >&2
+    return 1
+  fi
+
+  printf '  %s:%s (sha256 ok, %ss)\n' \
+    "$OC_RHOST" "$dest" "$(( $(date +%s) - t0 ))"
+}
+
+# full copy of the database before anything destructive: a local verified
+# ".backup" copy in $BACKUP, or – when BACKUP_REMOTE is set – a checkpointed raw
+# copy streamed with rsync (no local temporary file).
 run_backup() {
   # only --vacuum rewrites the file, so only --vacuum needs this safety net
   (( OC_BACKUP )) || return 0
@@ -358,6 +466,11 @@ run_backup() {
     return 1
   fi
   oc_guard_closed
+
+  if [[ -n "${BACKUP_REMOTE:-}" ]]; then
+    run_backup_remote
+    return
+  fi
 
   local file_b avail dest chk t0
   file_b=$(stat -c%s "$DB")
@@ -391,11 +504,16 @@ run_backup() {
       "$(fmt_b "$(stat -c%s "$dest")")" "$(fmt_b "$file_b")" >&2
     return 1
   fi
+  # an interrupted check leaves an empty -wal/-shm next to the copy – drop them
+  trap 'rm -f "$dest-wal" "$dest-shm"; exit 130' INT TERM
+  printf '  integrity check of the copy (reads the whole backup again) … '
   chk=$(sqlite3 -readonly "$dest" 'PRAGMA integrity_check;') || chk=''
+  trap - INT TERM
   if [[ "$chk" != "ok" ]]; then
-    printf '  integrity check of the copy FAILED (%s) – aborting.\n' "$chk" >&2
+    printf 'FAILED (%s) – aborting.\n' "$chk" >&2
     return 1
   fi
+  echo ok
   # reading a WAL-mode copy creates an empty -wal/-shm next to it – drop them
   if [[ ! -f "$dest-wal" || "$(stat -c%s "$dest-wal")" -eq 0 ]]; then
     rm -f "$dest-wal" "$dest-shm"
@@ -643,12 +761,14 @@ run_vacuum_remote() {
   # the emptied WAL/SHM belong to the old file, never reuse them
   rm -f "$DB-wal" "$DB-shm"
 
+  printf '  integrity check of the database … '
   chk=$(sqlw 'PRAGMA integrity_check;') || chk=''
   if [[ "$chk" != "ok" ]]; then
-    printf '  integrity check of the database FAILED (%s)\n' "$chk" >&2
+    printf 'FAILED (%s)\n' "$chk" >&2
     printf '  restore it with: cp %s %s\n' "$dest" "$DB" >&2
     return 1
   fi
+  echo ok
   sqlw 'PRAGMA journal_mode=WAL;' >/dev/null || true
 
   after=$(stat -c%s "$DB")
