@@ -1,13 +1,16 @@
 # oc-lib.sh – shared reporting and deletion logic for oc-prune.sh / oc-prune-db.sh
-# The opencode database is only read with "sqlite3 -readonly" – the exception is
-# the --vacuum path: run_vacuum opens it writable for the checkpoint and
-# VACUUM INTO, and run_backup does the same checkpoint when BACKUP_REMOTE is set
-# (raw rsync copy). Writes go to $BACKUP (exports/local backup) and
-# $BACKUP_REMOTE (full database backup); otherwise only our size cache is written.
+# The opencode database is only read with "sqlite3 -readonly" – the exceptions are
+# the --vacuum path (run_vacuum opens it writable for the checkpoint and
+# VACUUM INTO, and run_backup does the same checkpoint when BACKUP_REMOTE is set)
+# and the V1 cleanup path (run_cleanup_legacy / the targeted legacy delete in
+# run_apply remove stale V1 rows after opencode v2 migrated them). Writes go to
+# $BACKUP (exports/local backup) and $BACKUP_REMOTE (full database backup);
+# otherwise only our size cache is written.
 
 declare -a OC_MISSING_DIRS=()
 APPLY=0
 OC_VACUUM=0
+OC_CLEANUP_LEGACY=0
 OC_BACKUP=1
 OC_MISSING='[]'
 OC_DATA_NOTE='-'
@@ -20,6 +23,17 @@ OC_ORPH_B=0
 OC_VAC_LIVE=0
 OC_VAC_MARGIN=0
 OC_VAC_NEED=0
+
+# detected database schema (see oc_schema_init)
+OC_SCHEMA_INIT=0
+OC_SCHEMA='none'          # v1 | v2 | mixed | none
+OC_MIGRATION=''           # kv migration.v1-v2 phase: completed | sessions | ''
+OC_SESSION_SRC=''         # SQL subquery with id, directory, time_created, time_updated, parent_id, version
+OC_LEGACY=0               # v2 store that still keeps the V1 tables
+OC_HAS_V1=0
+OC_HAS_V2=0
+OC_HAS_SESSION_MESSAGE=0
+OC_HAS_SESSION_PART=0
 
 # read .env first (only variables that are still unset), then apply defaults
 oc_init() {
@@ -35,6 +49,7 @@ oc_init() {
   DB=${DB:-$HOME/.local/share/opencode/opencode.db}
   ONLY=${ONLY:-}
   SIZE_CACHE=${SIZE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/oc-prune/db-data.tsv}
+  OC_BIN=${OC_BIN:-opencode}
 }
 
 load_env() {
@@ -51,7 +66,7 @@ load_env() {
     if [[ "$v" == \"*\" ]]; then v=${v:1:-1}; fi
     if [[ "$v" == \'*\' ]]; then v=${v:1:-1}; fi
     case "$k" in
-      ROOT|DAYS|MIN|BACKUP|BACKUP_REMOTE|DB|ONLY|SIZES|SIZE_CACHE)
+      ROOT|DAYS|MIN|BACKUP|BACKUP_REMOTE|DB|ONLY|SIZES|SIZE_CACHE|OC_BIN)
         if [[ -z "${!k:-}" ]]; then printf -v "$k" '%s' "$v"; fi ;;
     esac
   done < "$f"
@@ -60,25 +75,31 @@ load_env() {
 sql()  { sqlite3 -readonly -cmd 'PRAGMA cache_size=8000;' "$DB" "$1"; }
 sqlj() { sqlite3 -readonly -json -cmd 'PRAGMA cache_size=8000;' "$DB" "$1"; }
 
-# writable access – only used by run_vacuum, see AGENTS.md
+# writable access – used by run_vacuum and the V1 cleanup (run_cleanup_legacy /
+# the targeted legacy delete in run_apply), see AGENTS.md
 sqlw() { sqlite3 -cmd 'PRAGMA cache_size=8000;' "$DB" "$1"; }
 
 oc_usage() {
   cat <<EOF
-Usage: $0 [--apply] [--vacuum] [--no-backup]
+Usage: $0 [--apply] [--vacuum] [--cleanup-legacy] [--no-backup]
 
   (no option)   dry run: report + table, nothing is modified
   --apply       export each session to \$BACKUP, then delete it
   --vacuum      full backup of the database, then compact it
                 (opencode must be closed, needs the expected compacted size free;
                 in a terminal it can compact via \$BACKUP if the disk is too small)
-  --no-backup   with --vacuum: compact without the backup copy
+  --cleanup-legacy
+                full backup, then delete the stale V1 rows that remain after
+                opencode v2 migrated the database (V1 sessions without a
+                session_v2 counterpart). Destructive, like --vacuum.
+  --no-backup   with --vacuum/--cleanup-legacy: work without the backup copy
 
-  BACKUP_REMOTE  [user@]host:/absolute/path – with --vacuum the full database
-                 copy is uploaded there via ssh/rsync instead of \$BACKUP
+  BACKUP_REMOTE  [user@]host:/absolute/path – with --vacuum/--cleanup-legacy the
+                 full database copy is uploaded there via ssh/rsync instead of
+                 \$BACKUP
 
 Configuration: environment variable -> .env -> default
-  ROOT DAYS MIN BACKUP BACKUP_REMOTE DB ONLY SIZES SIZE_CACHE
+  ROOT DAYS MIN BACKUP BACKUP_REMOTE DB ONLY SIZES SIZE_CACHE OC_BIN
 EOF
 }
 
@@ -87,10 +108,11 @@ oc_args() {
   local a
   for a in "$@"; do
     case "$a" in
-      --apply)    APPLY=1 ;;
-      --vacuum)   OC_VACUUM=1 ;;
-      --no-backup) OC_BACKUP=0 ;;
-      -h|--help)  oc_usage; exit 0 ;;
+      --apply)          APPLY=1 ;;
+      --vacuum)         OC_VACUUM=1 ;;
+      --cleanup-legacy) OC_CLEANUP_LEGACY=1 ;;
+      --no-backup)      OC_BACKUP=0 ;;
+      -h|--help)        oc_usage; exit 0 ;;
       *) printf 'Unknown option: %s (try %s --help)\n' "$a" "$0" >&2
          return 1 ;;
     esac
@@ -107,12 +129,101 @@ fmt_b() {
 
 db_readable() { command -v sqlite3 >/dev/null 2>&1 && [[ -r "$DB" ]]; }
 
+# detect which schema the database uses. V1 stores sessions in "session" with
+# turns in "message"/"part"; V2 keeps the legacy tables after an in-place upgrade
+# and moves the live data to "session_v2"/"session_message"/"session_part". The
+# migration state lives in "kv" under "migration.v1-v2". Sets OC_SCHEMA, the
+# table flags and OC_SESSION_SRC (the active session source for all queries).
+oc_schema_init() {
+  OC_SCHEMA_INIT=1
+  OC_SCHEMA=none
+  OC_MIGRATION=''
+  OC_LEGACY=0
+  OC_HAS_V1=0
+  OC_HAS_V2=0
+  OC_HAS_SESSION_MESSAGE=0
+  OC_HAS_SESSION_PART=0
+  OC_SESSION_SRC=''
+
+  db_readable || return 0
+
+  local n
+  n=$(sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session';") || return 0
+  (( n )) && OC_HAS_V1=1
+  n=$(sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_v2';") || true
+  (( ${n:-0} )) && OC_HAS_V2=1
+  n=$(sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_message';") || true
+  (( ${n:-0} )) && OC_HAS_SESSION_MESSAGE=1
+  n=$(sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_part';") || true
+  (( ${n:-0} )) && OC_HAS_SESSION_PART=1
+
+  if (( OC_HAS_V2 )); then
+    n=$(sql "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='kv';") || true
+    if (( ${n:-0} )); then
+      OC_MIGRATION=$(sql "SELECT coalesce(json_extract(value, '\$.phase'), '') FROM kv WHERE key='migration.v1-v2' LIMIT 1;") \
+        || OC_MIGRATION=''
+    fi
+    if (( OC_HAS_V1 )) && [[ "$OC_MIGRATION" != "completed" ]]; then
+      OC_SCHEMA=mixed
+    else
+      OC_SCHEMA=v2
+    fi
+  elif (( OC_HAS_V1 )); then
+    OC_SCHEMA=v1
+  else
+    return 0
+  fi
+
+  (( OC_HAS_V1 && OC_HAS_V2 )) && OC_LEGACY=1
+
+  case "$OC_SCHEMA" in
+    v1)
+      OC_SESSION_SRC="SELECT id, directory, time_created, time_updated, parent_id, version FROM session" ;;
+    v2)
+      OC_SESSION_SRC="SELECT id, directory, time_created, time_updated, parent_id, version FROM session_v2" ;;
+    mixed)
+      OC_SESSION_SRC="SELECT id, directory, time_created, time_updated, parent_id, version FROM session_v2
+        UNION ALL
+        SELECT id, directory, time_created, time_updated, parent_id, version FROM session s
+        WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)" ;;
+  esac
+}
+
 # "-x" matches the exact process name – "-f opencode" would also match
-# "vim opencode.json" and our own command line (…/opencode-prune/…)
+# "vim opencode.json" and our own command line (.../opencode-prune/...).
+# opencode v2 may be installed as "opencode2" as well as "opencode".
 oc_guard_closed() {
-  pgrep -u "$USER" -x opencode >/dev/null && {
-    echo "opencode is still running, please quit it first." >&2; exit 1; }
+  local b bin
+  bin=${OC_BIN:-opencode}
+  for b in opencode opencode2 "${bin##*/}"; do
+    [[ -n "$b" ]] || continue
+    if pgrep -u "$USER" -x "$b" >/dev/null; then
+      echo "$b is still running, please quit it first." >&2
+      exit 1
+    fi
+  done
   return 0
+}
+
+# schema-aware export command: v1 has a top-level "export", v2 only "session export"
+oc_export_session() {
+  if [[ "$OC_SCHEMA" == "v2" ]]; then
+    "${OC_BIN:-opencode}" session export "$1"
+  else
+    "${OC_BIN:-opencode}" export "$1"
+  fi
+}
+
+# installed CLI version – read once, no DB access. Last non-empty line, so a
+# banner an older build prints before the number does not leak in.
+OC_CLI_VERSION=''
+oc_cli_version() {
+  if [[ -z "$OC_CLI_VERSION" ]]; then
+    OC_CLI_VERSION=$("${OC_BIN:-opencode}" --version 2>/dev/null \
+      | awk 'NF { last = $0 } END { print last }')
+    OC_CLI_VERSION=${OC_CLI_VERSION:-unknown}
+  fi
+  printf '%s' "$OC_CLI_VERSION"
 }
 
 oc_free_bytes() { df -B1 --output=avail "$1" | tail -n1 | tr -d ' '; }
@@ -128,6 +239,8 @@ db_report() {
     return 0
   fi
 
+  (( OC_SCHEMA_INIT )) || oc_schema_init
+
   local prg pages psize freelist file_b=0 wal_b=0 db_b free_b
   prg=$(sql "SELECT page_count||'|'||page_size||'|'||freelist_count
              FROM pragma_page_count, pragma_page_size, pragma_freelist_count;") || prg=''
@@ -142,6 +255,38 @@ db_report() {
   [[ -f "$DB-wal" ]] && wal_b=$(stat -c%s "$DB-wal")
 
   printf 'Database (read-only): %s\n' "$DB"
+  case "$OC_SCHEMA" in
+    v1)    printf '  schema v1 (session/message/part)\n' ;;
+    v2)    printf '  schema v2 (session_v2/session_message/session_part)\n' ;;
+    mixed) printf '  schema v2, V1 migration still running (%s)\n' "${OC_MIGRATION:-no state}" ;;
+    *)     printf '  schema unknown (no session or session_v2 table)\n' ;;
+  esac
+  if (( OC_LEGACY )); then
+    local lo
+    lo=$(sql "SELECT count(*) FROM session s
+              WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id);") || lo=0
+    printf '  V1 rows %s (left over by the v2 migration; cleaned with --cleanup-legacy)\n' "${lo:-0}"
+  fi
+
+  local cli sver sn cli_major=''
+  cli=$(oc_cli_version)
+  sver=''; sn=0
+  if [[ -n "$OC_SESSION_SRC" ]]; then
+    sver=$(sql "SELECT coalesce(max(version),'') FROM ($OC_SESSION_SRC);") || sver=''
+    sn=$(sql "SELECT count(distinct version) FROM ($OC_SESSION_SRC);") || sn=0
+  fi
+  printf '  opencode %s (CLI) | sessions up to %s' "$cli" "${sver:-unknown}"
+  if [[ "${sn:-0}" -gt 1 ]]; then printf ' (%s versions)' "$sn"; fi
+  printf '\n'
+  if [[ "$cli" =~ ^([0-9]+) ]]; then cli_major=${BASH_REMATCH[1]}; fi
+  if [[ -n "$cli_major" ]]; then
+    if [[ "$OC_SCHEMA" == "v2" && "$cli_major" -lt 2 ]]; then
+      printf '  WARNING: database is v2 but the CLI is v1 – set OC_BIN to the v2 binary\n'
+    elif [[ "$OC_SCHEMA" == "v1" && "$cli_major" -ge 2 ]]; then
+      printf '  note: database is still v1; starting opencode v2 migrates it in place\n'
+    fi
+  fi
+
   printf '  file %s | WAL %s | freelist %s (%s %%)\n' \
     "$(fmt_b "$file_b")" "$(fmt_b "$wal_b")" "$(fmt_b "$free_b")" \
     "$(awk -v a="$free_b" -v b="$db_b" 'BEGIN{printf "%.1f", (b ? 100*a/b : 0)}')"
@@ -151,7 +296,7 @@ db_report() {
   fi
 
   local cnt n_all n_sub
-  cnt=$(sql "SELECT count(*)||'|'||coalesce(sum(parent_id IS NOT NULL),0) FROM session;") || cnt=''
+  cnt=$(sql "SELECT count(*)||'|'||coalesce(sum(parent_id IS NOT NULL),0) FROM ($OC_SESSION_SRC);") || cnt=''
   IFS='|' read -r n_all n_sub <<< "${cnt:-0|0}"
   printf '  sessions %s (+ %s subagents)\n' "$(( ${n_all:-0} - ${n_sub:-0} ))" "${n_sub:-0}"
 
@@ -168,7 +313,7 @@ db_report() {
       lines+=("$line")
     fi
   done < <(sql "SELECT directory||'|'||sum(parent_id IS NULL)||'|'||sum(parent_id IS NOT NULL)
-                FROM session GROUP BY directory ORDER BY count(*) DESC;")
+                FROM ($OC_SESSION_SRC) GROUP BY directory ORDER BY count(*) DESC;")
 
   if ((${#lines[@]})); then
     printf '  Missing directories:\n'
@@ -185,7 +330,7 @@ oc_augment_missing() {
   [[ -n "$sessions" ]] || sessions='[]'
   if db_readable && ((${#OC_MISSING_DIRS[@]})); then
     extra=$(sqlj "SELECT id, directory, time_updated AS updated
-                  FROM session WHERE parent_id IS NULL;") || extra='[]'
+                  FROM ($OC_SESSION_SRC) WHERE parent_id IS NULL;") || extra='[]'
     printf '%s' "$sessions" | jq -c --argjson all "${extra:-[]}" --argjson miss "$OC_MISSING" '
       . as $s
       | ($all
@@ -212,6 +357,7 @@ oc_filter_only() {
 # table sizes, orphan events and data per directory (cached)
 db_sizes() {
   db_readable || return 0
+  (( OC_SCHEMA_INIT )) || oc_schema_init
 
   if [[ "${SIZES:-1}" == "0" ]]; then
     OC_DATA_NOTE='skipped (SIZES=0)'
@@ -219,8 +365,15 @@ db_sizes() {
     local key raw
     # key uses count and time_created only: it stays stable while opencode is
     # working (time_updated keeps changing then) but a new or deleted session
-    # still triggers a recomputation
-    key=$(sql "SELECT count(*)||'/'||coalesce(max(time_created),0) FROM session;") || key=''
+    # still triggers a recomputation. Schema and the V1 leftovers are part of
+    # the key so a v1 -> v2 upgrade invalidates the cache.
+    local lo=0
+    key=$(sql "SELECT count(*)||'/'||coalesce(max(time_created),0) FROM ($OC_SESSION_SRC);") || key=''
+    if (( OC_LEGACY )); then
+      lo=$(sql "SELECT count(*) FROM session s
+                WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id);") || lo=0
+    fi
+    key="$OC_SCHEMA/$OC_MIGRATION/${key:-0}/$lo"
     if [[ -n "$key" && -r "$SIZE_CACHE" && "$(head -n1 "$SIZE_CACHE")" == "key=$key" ]]; then
       raw="$SIZE_CACHE"
       OC_DATA_NOTE="cached (snapshot $key)"
@@ -253,15 +406,28 @@ db_sizes() {
 # one full scan of the event table plus a small part scan
 oc_compute_raw() {
   local t
-  t=$(sql "SELECT coalesce(sum(CASE WHEN name LIKE 'event%'   THEN pgsize ELSE 0 END),0)||'|'||
-                  coalesce(sum(CASE WHEN name LIKE 'part%'    THEN pgsize ELSE 0 END),0)||'|'||
-                  coalesce(sum(CASE WHEN name LIKE 'message%' THEN pgsize ELSE 0 END),0)||'|'||
-                  coalesce(sum(CASE WHEN name LIKE 'session%' THEN pgsize ELSE 0 END),0)
-           FROM dbstat;") || return 1
+  t=$(sql "SELECT
+             coalesce(sum(CASE cat WHEN 'ev'  THEN pgsize ELSE 0 END),0)||'|'||
+             coalesce(sum(CASE cat WHEN 'pt'  THEN pgsize ELSE 0 END),0)||'|'||
+             coalesce(sum(CASE cat WHEN 'msg' THEN pgsize ELSE 0 END),0)||'|'||
+             coalesce(sum(CASE cat WHEN 'ses' THEN pgsize ELSE 0 END),0)
+           FROM (
+             SELECT pgsize, CASE
+               WHEN name LIKE 'event%' THEN 'ev'
+               WHEN name LIKE 'session_part%' THEN 'pt'
+               WHEN name LIKE 'part%' THEN 'pt'
+               WHEN name LIKE 'session_message%' THEN 'msg'
+               WHEN name LIKE 'message%' THEN 'msg'
+               WHEN name LIKE 'session%' OR name LIKE 'instruction%'
+                 OR name LIKE 'blob%' OR name LIKE 'todo%' THEN 'ses'
+               ELSE 'x'
+             END AS cat
+             FROM dbstat
+           );") || return 1
   printf 'tables\t%s\n' "$t"
 
   sql "SELECT coalesce(s.directory,'')||'|'||count(*)||'|'||sum(length(e.data))
-       FROM event e LEFT JOIN session s ON s.id = e.aggregate_id
+       FROM event e LEFT JOIN ($OC_SESSION_SRC) s ON s.id = e.aggregate_id
        GROUP BY s.directory;" |
   while IFS='|' read -r d n b; do
     if [[ -n "$d" ]]; then
@@ -271,12 +437,49 @@ oc_compute_raw() {
     fi
   done
 
-  sql "SELECT s.directory||'|'||sum(length(p.data))
-       FROM part p JOIN session s ON s.id = p.session_id
-       GROUP BY s.directory;" |
-  while IFS='|' read -r d b; do
-    printf 'pt\t%s\t%s\n' "$d" "$b"
-  done
+  oc_compute_part_data
+}
+
+# per-directory data of the message/part payload. V2 moved the live data to
+# session_message/session_part; the legacy message/part tables are only counted
+# for V1 sessions that have no session_v2 counterpart yet (no double counting).
+oc_compute_part_data() {
+  local d b
+  if (( OC_HAS_V2 )); then
+    if (( OC_HAS_SESSION_PART )); then
+      sql "SELECT s.directory||'|'||sum(length(p.data))
+           FROM session_part p JOIN session_v2 s ON s.id = p.session_id
+           GROUP BY s.directory;" |
+      while IFS='|' read -r d b; do
+        if [[ -n "$b" ]]; then printf 'pt\t%s\t%s\n' "$d" "$b"; fi
+      done
+    elif (( OC_HAS_SESSION_MESSAGE )); then
+      sql "SELECT s.directory||'|'||sum(length(m.data))
+           FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+           GROUP BY s.directory;" |
+      while IFS='|' read -r d b; do
+        if [[ -n "$b" ]]; then printf 'pt\t%s\t%s\n' "$d" "$b"; fi
+      done
+    fi
+  fi
+  if (( OC_HAS_V1 )); then
+    if (( OC_HAS_V2 )); then
+      sql "SELECT s.directory||'|'||sum(length(p.data))
+           FROM part p JOIN session s ON s.id = p.session_id
+           WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)
+           GROUP BY s.directory;" |
+      while IFS='|' read -r d b; do
+        if [[ -n "$b" ]]; then printf 'pt\t%s\t%s\n' "$d" "$b"; fi
+      done
+    else
+      sql "SELECT s.directory||'|'||sum(length(p.data))
+           FROM part p JOIN session s ON s.id = p.session_id
+           GROUP BY s.directory;" |
+      while IFS='|' read -r d b; do
+        if [[ -n "$b" ]]; then printf 'pt\t%s\t%s\n' "$d" "$b"; fi
+      done
+    fi
+  fi
 }
 
 oc_parse_raw() {
@@ -297,9 +500,10 @@ oc_parse_raw() {
 
 # all top-level sessions (subagents are left out, like "opencode session list")
 db_sessions() {
+  (( OC_SCHEMA_INIT )) || oc_schema_init
   local out
   out=$(sqlj "SELECT id, directory, time_updated AS updated
-              FROM session WHERE parent_id IS NULL;") || out=''
+              FROM ($OC_SESSION_SRC) WHERE parent_id IS NULL;") || out=''
   printf '%s\n' "${out:-[]}"
 }
 
@@ -468,9 +672,10 @@ run_backup_remote() {
 # ".backup" copy in $BACKUP, or – when BACKUP_REMOTE is set – a checkpointed raw
 # copy streamed with rsync (no local temporary file).
 run_backup() {
-  # only --vacuum rewrites the file, so only --vacuum needs this safety net
+  # only --vacuum rewrites the file and --cleanup-legacy deletes stale V1 rows,
+  # so only they need this safety net
   (( OC_BACKUP )) || return 0
-  (( OC_VACUUM )) || return 0
+  (( OC_VACUUM || OC_CLEANUP_LEGACY )) || return 0
 
   printf '\nBackup:\n'
   if ! db_readable; then
@@ -535,18 +740,28 @@ run_backup() {
 
 run_apply() {
   local sessions=$1
+  (( OC_SCHEMA_INIT )) || oc_schema_init
 
   if (( APPLY == 0 )); then
-    if (( OC_VACUUM == 0 )); then
+    if (( OC_VACUUM == 0 && OC_CLEANUP_LEGACY == 0 )); then
       printf '\nDry run. To delete: %s --apply\n' "$0"
       exit 0
     fi
-    # --vacuum without --apply: nothing is deleted, the file is compacted only
-    run_vacuum
+    # --cleanup-legacy already ran in the entry script; --vacuum without --apply
+    # compacts only, nothing is deleted here
+    if (( OC_VACUUM )); then
+      run_vacuum
+    fi
     exit 0
   fi
 
   oc_guard_closed
+
+  if [[ "$OC_SCHEMA" == "mixed" ]]; then
+    printf 'The V1 -> V2 migration is still running. Let opencode v2 finish it first\n' >&2
+    printf '(start it once and wait until it is idle), then run this again.\n' >&2
+    exit 1
+  fi
 
   printf 'Export to: %s\n' "$BACKUP"
   mkdir -p "$BACKUP" 2>/dev/null || {
@@ -572,7 +787,7 @@ run_apply() {
         if [[ -n "$ONLY" && "$dir" != "$ONLY" && "$dir" != "$ONLY"/* ]]; then continue; fi
         printf '%s\t%s\n' "$id" "$dir" >> "$TMP/targets_sub"
       done
-    done < <(sql "SELECT id||'|'||directory FROM session WHERE parent_id IS NOT NULL;")
+    done < <(sql "SELECT id||'|'||directory FROM ($OC_SESSION_SRC) WHERE parent_id IS NOT NULL;")
   fi
 
   local n i=0 f out
@@ -585,12 +800,16 @@ run_apply() {
       out="$BACKUP/$(basename "$dir")"
       mkdir -p "$out"
       printf 'deleting [%d/%d] %s (%s) … ' "$i" "$n" "$id" "$dir" >&2
-      opencode export "$id" > "$out/$id.json"
+      oc_export_session "$id" > "$out/$id.json"
       if [[ ! -s "$out/$id.json" ]]; then
         echo "Empty export: $id" >&2
         exit 1
       fi
-      opencode session delete "$id"
+      "${OC_BIN:-opencode}" session delete "$id"
+      # v2 deleted only session_v2/events; drop the stale V1 copy of the subtree
+      if (( OC_LEGACY )) && [[ "$OC_SCHEMA" == "v2" ]]; then
+        oc_legacy_delete_subtree "$id"
+      fi
       echo "deleted" >&2
     done < "$f"
   done
@@ -612,6 +831,88 @@ run_apply() {
   elif (( OC_VACUUM )); then
     run_vacuum
   fi
+}
+
+# --- V1 leftovers in a migrated V2 store --------------------------------
+# opencode v2 copies the V1 sessions into session_v2/session_message but keeps
+# the legacy "session"/"message"/"part" rows. Deleting through the v2 CLI only
+# touches the v2 tables, so these helpers remove the stale V1 rows afterwards.
+
+# legacy sessions without a session_v2 counterpart (already deleted in v2)
+oc_legacy_orphan_ids() {
+  (( OC_LEGACY )) || return 0
+  [[ "$OC_SCHEMA" == "v2" ]] || return 0
+  sql "SELECT id FROM session s WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id);"
+}
+
+# delete one session subtree from the legacy V1 tables. targets_sub is deleted
+# after the v2 root, so the legacy children are reached through parent_id.
+oc_legacy_delete_subtree() {
+  local id=$1
+  (( OC_LEGACY )) || return 0
+  [[ "$OC_SCHEMA" == "v2" ]] || return 0
+  if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    printf '  Refusing to delete an unsafe legacy session id: %s\n' "$id" >&2
+    return 1
+  fi
+  sqlw "PRAGMA foreign_keys=ON;
+        PRAGMA busy_timeout=5000;
+        BEGIN IMMEDIATE;
+        WITH RECURSIVE tree(id) AS (
+          SELECT id FROM session WHERE id='$id'
+          UNION
+          SELECT s.id FROM session s JOIN tree t ON s.parent_id = t.id
+        )
+        DELETE FROM session WHERE id IN (SELECT id FROM tree);
+        COMMIT;" >/dev/null
+}
+
+# --cleanup-legacy: backup already happened, now drop every stale V1 row
+run_cleanup_legacy() {
+  (( OC_CLEANUP_LEGACY )) || return 0
+  (( OC_SCHEMA_INIT )) || oc_schema_init
+
+  printf '\nLegacy cleanup:\n'
+  if ! db_readable; then
+    printf '  sqlite3 or %s not available\n' "$DB" >&2
+    return 1
+  fi
+  case "$OC_SCHEMA" in
+    v1)
+      printf '  V1 schema, no leftover rows from a v2 migration.\n'
+      return 0 ;;
+    mixed)
+      printf '  The V1 -> V2 migration is still running, aborting.\n' >&2
+      return 1 ;;
+    none)
+      printf '  no session table detected, nothing to clean.\n'
+      return 0 ;;
+  esac
+  if (( ! OC_LEGACY )); then
+    printf '  no legacy V1 tables detected, nothing to clean.\n'
+    return 0
+  fi
+
+  oc_guard_closed
+
+  local ids n
+  ids=$(oc_legacy_orphan_ids) || return 1
+  n=$(printf '%s\n' "$ids" | awk 'NF{n++} END{print n+0}')
+  if (( n == 0 )); then
+    printf '  no stale V1 rows to remove.\n'
+    return 0
+  fi
+
+  printf '  removing %s stale V1 sessions (V1 rows without session_v2) ... ' "$n"
+  if ! sqlw "PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;
+             BEGIN IMMEDIATE;
+             DELETE FROM session WHERE id NOT IN (SELECT id FROM session_v2);
+             COMMIT;" >/dev/null; then
+    printf 'FAILED\n' >&2
+    return 1
+  fi
+  printf 'done\n'
 }
 
 # checkpoint + integrity check – shared by both vacuum routes

@@ -9,7 +9,7 @@ names, IDs or credentials may be committed (`.env` is gitignored for that reason
 
 | File | Contents |
 |---|---|
-| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup` (+ `run_backup_remote`, `backup_remote_parse`), `run_apply`, `run_vacuum` (+ `vacuum_prepare`, `vacuum_need`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
+| `oc-lib.sh` | shared logic (sourced by both scripts): `oc_init`, `oc_args`, `oc_schema_init` (V1/V2 detection + `OC_SESSION_SRC`), `oc_cli_version`, `db_report`, `oc_augment_missing`, `oc_filter_only`, `db_sizes`, `print_table`, `run_backup` (+ `run_backup_remote`, `backup_remote_parse`), `oc_export_session`, `run_apply`, `run_cleanup_legacy` (+ `oc_legacy_orphan_ids`, `oc_legacy_delete_subtree`), `run_vacuum` (+ `vacuum_prepare`, `vacuum_need`, `run_vacuum_remote`, helpers `oc_guard_closed`, `oc_free_bytes`) |
 | `oc-prune.sh` | scan with `opencode session list` per directory, progress on stderr |
 | `oc-prune-db.sh` | scan with one `SELECT` (fast, complete) |
 | `.env` | local configuration; precedence: environment variable → `.env` → default |
@@ -21,12 +21,15 @@ logic into the lib instead of duplicating it.
 
 ## Rules
 
-- **Read the opencode database with `sqlite3 -readonly`.** The only writable path is
-  `--vacuum`: `run_vacuum` uses `PRAGMA wal_checkpoint(TRUNCATE)`,
-  `PRAGMA integrity_check`, `VACUUM INTO` and the swap (including removal of the stale
-  `-wal`/`-shm`), and `run_backup` uses the checkpoint only when `BACKUP_REMOTE` is set
-  (the raw `rsync` snapshot needs an empty WAL). Without `BACKUP_REMOTE`, `run_backup`
-  stays read-only (`sqlite3 -readonly "$DB" ".backup …"`). Besides our size cache under
+- **Read the opencode database with `sqlite3 -readonly`.** The writable paths are
+  `--vacuum` (`run_vacuum` uses `PRAGMA wal_checkpoint(TRUNCATE)`,
+  `PRAGMA integrity_check`, `VACUUM INTO` and the swap including removal of the stale
+  `-wal`/`-shm`; `run_backup` uses the checkpoint only when `BACKUP_REMOTE` is set,
+  because the raw `rsync` snapshot needs an empty WAL) and the V1 cleanup
+  (`run_cleanup_legacy` / the targeted `oc_legacy_delete_subtree` in `run_apply` delete
+  only stale `session` rows after opencode v2 migrated them; `PRAGMA foreign_keys=ON`,
+  one transaction, never v2 tables). Without `BACKUP_REMOTE`, `run_backup` stays
+  read-only (`sqlite3 -readonly "$DB" ".backup ..."`). Besides our size cache under
   `~/.cache/oc-prune/`, only `$BACKUP` (exports/local backup) and `$BACKUP_REMOTE`
   (full database backup) are written to.
 - **`run_vacuum` has two routes**, both writing only through `sqlw` + `mv`/`cp`: the
@@ -39,27 +42,36 @@ logic into the lib instead of duplicating it.
   size locally: `cp` truncates the database first, so its local check uses the actual
   compacted size after `VACUUM INTO` (`compacted ≤ file + free`) and aborts with the
   verified `$BACKUP` copy left in place if even that does not fit.
-- **`--vacuum` is backup-first**: `run_backup` runs before `run_apply` in both entry
-  scripts, so a copy exists before anything is deleted or rewritten. Without
-  `BACKUP_REMOTE` it needs the directory `$BACKUP` to already exist (a not mounted path
-  would silently write to `/`) and as much free space there as the database is big; the
-  copy is verified with `PRAGMA integrity_check`, which reads it **again** – on a
-  network target that takes about as long as the copy, so keep the progress line
-  announced before it. With `BACKUP_REMOTE` the raw database is checkpointed, streamed
-  with `rsync` (no local copy) and verified with `sha256sum` on both sides; the remote
-  directory must already exist, be writable by the SSH user and have the database size
-  free. `run_vacuum` in turn **aborts unless the database filesystem has the expected
-  compacted size (live pages + margin: 10 %, min. 256 MiB) free** – keep those rules
-  when touching either function, and document them in the README command reference.
-- **`BACKUP_REMOTE` is only for the full backup before `--vacuum`.** Exports still go
-  to `$BACKUP`. The format is `[user@]host:/absolute/path` (simple ASCII, no spaces,
-  colons or shell metacharacters in the path). SSH runs with `BatchMode=yes`, so keys
-  must be set up. The remote needs `rsync` and `sha256sum`; `sqlite3` is not required
-  because the source is integrity-checked locally and the transfer is
-  checksum-verified.
-- **Never run `--apply` without explicit approval.** Verify with a dry run and by
-  generating the target lists (see below). The same holds for `--vacuum` against the
-  real database – it rewrites the file. Test vacuum mechanics on a copy in `/tmp`.
+- **`--vacuum` and `--cleanup-legacy` are backup-first**: `run_backup` runs before
+  `run_apply`/`run_cleanup_legacy` in both entry scripts, so a copy exists before
+  anything is deleted or rewritten. Without `BACKUP_REMOTE` it needs the directory
+  `$BACKUP` to already exist (a not mounted path would silently write to `/`) and as
+  much free space there as the database is big; the copy is verified with
+  `PRAGMA integrity_check`, which reads it **again** – on a network target that takes
+  about as long as the copy, so keep the progress line announced before it. With
+  `BACKUP_REMOTE` the raw database is checkpointed, streamed with `rsync` (no local
+  copy) and verified with `sha256sum` on both sides; the remote directory must already
+  exist, be writable by the SSH user and have the database size free. `run_vacuum` in
+  turn **aborts unless the database filesystem has the expected compacted size
+  (live pages + margin: 10 %, min. 256 MiB) free** – keep those rules when touching
+  either function, and document them in the README command reference.
+- **The V1 leftovers of a v2 migration are deleted separately from the v2 tables.**
+  `--apply` only deletes the legacy copy of a session it already deleted through the
+  v2 CLI; `--cleanup-legacy` deletes all `session` rows without a `session_v2`
+  counterpart. Both require `OC_SCHEMA=v2` and a `completed` `kv` state
+  (`migration.v1-v2`); a running migration (`mixed`) aborts. Legacy data was already
+  dropped in v2 and cascades to `message`/`part` via `PRAGMA foreign_keys=ON`, so keep
+  that transaction atomic and never touch v2 tables.
+- **`BACKUP_REMOTE` is only for the full backup before `--vacuum`/`--cleanup-legacy`.**
+  Exports still go to `$BACKUP`. The format is `[user@]host:/absolute/path` (simple
+  ASCII, no spaces, colons or shell metacharacters in the path). SSH runs with
+  `BatchMode=yes`, so keys must be set up. The remote needs `rsync` and `sha256sum`;
+  `sqlite3` is not required because the source is integrity-checked locally and the
+  transfer is checksum-verified.
+- **Never run `--apply`, `--vacuum` or `--cleanup-legacy` without explicit approval.**
+  Verify with a dry run and by generating the target lists (see below). The same holds
+  for these actions against the real database – they rewrite or delete. Test the
+  mechanics on a copy in `/tmp`.
 - Global rules from `~/.config/opencode/AGENTS.md` apply as well (among others: no
   co-authors in commits).
 
@@ -71,9 +83,10 @@ logic into the lib instead of duplicating it.
   progress and info messages go through `printf … >&2`.
 - Set defaults only inside `oc_init`, **after** `load_env` – otherwise the default
   overwrites the value from `.env` and the file has no effect.
-- Flags (`--apply`, `--vacuum`, `--no-backup`, `--help`) are parsed once in `oc_args`;
-  the entry scripts only call `oc_init` + `oc_args "$@"`. Keep both scripts identical
-  there, including the `run_backup` call before `run_apply`.
+- Flags (`--apply`, `--vacuum`, `--cleanup-legacy`, `--no-backup`, `--help`) are parsed
+  once in `oc_args`; the entry scripts only call `oc_init` + `oc_args "$@"`. Keep both
+  scripts identical there, including the `run_backup` → `run_cleanup_legacy` → `run_apply`
+  order.
 - Bind a variable before a jq filter uses it (`(.directory) as $d | if ($miss | index($d)) …`).
   `index(.[0].directory)` inside `$miss |` refers to the wrong `.` and jq reports a
   parse/type error.
@@ -88,16 +101,33 @@ logic into the lib instead of duplicating it.
 - `GROUP BY 1` with aggregates in the same select list is forbidden in SQLite →
   `GROUP BY <column>`.
 - `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line
-  (`…/opencode-prune/…`) → `pgrep -x opencode`.
+  (`.../opencode-prune/...`) → `pgrep -x opencode` (plus `-x opencode2` and the
+  `OC_BIN` basename, because a v2 preview may run under another name).
 - The `session` table has **no CASCADE on `parent_id`**: subagent sessions of missing
   directories must be deleted before the top-level sessions, otherwise orphans remain.
 - `opencode session list` only returns the project of the current working directory;
   sessions of missing directories and sessions of a second project in the same
   directory are missing. `oc_augment_missing` adds sessions of missing directories back.
 - Cache key over `count(*)`/`max(time_created)`, **not** over `max(time_updated)` –
-  that changes all the time while opencode runs and the cache would never hit.
+  that changes all the time while opencode runs and the cache would never hit. Include
+  `OC_SCHEMA`/`OC_MIGRATION` and the V1-orphan count so a v1 → v2 upgrade invalidates it.
+- A v2 store keeps the old `session`/`message`/`part` tables after the in-place
+  migration. `session_v2` (not `event`/`session_message`) is the v2 marker, and the
+  migration state lives in `kv` under `migration.v1-v2`. After `completed`, read only
+  `session_v2` – a union would resurrect sessions deleted in v2 through their V1 copies.
+- v1 exports with `opencode export`, v2 only with `opencode session export`;
+  `oc_export_session` chooses based on `OC_SCHEMA`.
+- `oc_cli_version` uses the last non-empty line of `--version` (some builds print a
+  banner first) and falls back to `unknown`; only parse the major when it is numeric.
+  The version line and the mismatch hint (`schema v2` + CLI v1, `schema v1` + CLI v2)
+  are informational – they must not change any behaviour.
+- Deleting through the v2 CLI does not touch the V1 tables: `--apply` must delete the
+  legacy subtree itself, otherwise the rows stay and `--vacuum` cannot reclaim them.
+- Bucket `dbstat` by explicit names, not `LIKE 'session%'`: in v2 `session_message%`
+  and `session_part%` would otherwise land in the `session` bucket. Check `session_part`
+  and `session_message` before `session`.
 
-## Keep the deletion rule in sync in three places
+## Keep the deletion rule in sync in four places
 
 Whoever changes the rules (currently: “directory missing → keep nothing”) has to adjust:
 
@@ -105,9 +135,12 @@ Whoever changes the rules (currently: “directory missing → keep nothing”) 
 2. `print_table` – the `Total` line (second jq call, same condition)
 3. `run_apply` – the target list `$TMP/targets` (otherwise the table promises something
    different from what is deleted)
+4. `run_apply` – the legacy subtree delete (`oc_legacy_delete_subtree` in a migrated v2
+   store) must cover exactly the sessions that were deleted through the CLI
 
-Also keep `db_report`, which fills `OC_MISSING`/`OC_MISSING_DIRS`, and
-`oc_filter_only` (`ONLY`) in mind.
+Also keep `db_report`, which fills `OC_MISSING`/`OC_MISSING_DIRS`, `oc_filter_only`
+(`ONLY`) and the active session source `OC_SESSION_SRC` (built by `oc_schema_init`) in
+mind.
 
 ## Verification
 
@@ -130,6 +163,29 @@ bash -c 'source ./oc-lib.sh; BACKUP_REMOTE="user@host:relative"; backup_remote_p
 # expect: error "must be [user@]host:/absolute/path", exit 1
 bash -c 'source ./oc-lib.sh; BACKUP_REMOTE="user@host:/path with space"; backup_remote_parse'
 # expect: same error, exit 1
+```
+
+> ⚠️ Always run the dry-run/destructive tests with `ENV_FILE=/dev/null` and an explicit
+> `DB=/tmp/...`: with the real `.env` a `BACKUP_REMOTE` test would upload to the real
+> backup target. Never point the fixtures at the real `$DB`.
+
+Schema + legacy cleanup on synthetic copies (a migrated v2 store is a copy of a v1
+store plus `session_v2`/`session_message`/`session_part` and a `kv` row
+`migration.v1-v2 = {"phase":"completed"}`; opencode is faked with a small script in
+`PATH` that only deletes `session_v2` and a `pgrep` stub that returns 1):
+
+```bash
+ENV_FILE=/dev/null DB=/tmp/oc-v2-test/v2mig.db SIZES=0 BACKUP=/tmp/oc-v2-test/bk \
+  ./oc-prune-db.sh                       # "schema v2", "V1 rows N", union off
+# expect below the schema line: "opencode <version> (CLI) | sessions up to <version>",
+# and with a v1 CLI on the v2 fixture a "WARNING: database is v2 but the CLI is v1"
+ENV_FILE=/dev/null DB=/tmp/oc-v2-test/v2mixed.db SIZES=0 ./oc-prune-db.sh
+# expect: "schema v2, V1 migration still running (sessions)", legacy rows in the table
+ENV_FILE=/dev/null DB=/tmp/oc-v2-test/v2mig.db SIZES=0 ./oc-prune-db.sh --apply
+# expect: abort with "V1 -> V2 migration is still running" for the mixed fixture
+# with the fake opencode + pgrep stub: --apply deletes the V1 subtree too; --cleanup-legacy
+# removes only the `session` rows without a `session_v2` counterpart and cascades to
+# message/part; `PRAGMA integrity_check` stays ok
 ```
 
 The actual remote flow is tested against the real target on a **copy** of the database

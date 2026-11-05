@@ -19,7 +19,7 @@ all_sessions() {
   done
   for d in "${dirs[@]}"; do
     (( ++i ))
-    json=$( (cd "$d" && opencode session list --format json 2>/dev/null) || true )
+    json=$( (cd "$d" && "${OC_BIN:-opencode}" session list --format json 2>/dev/null) || true )
     stats=$(printf '%s' "$json" | jq -r --arg d "${d%/}" --argjson c "$CUTOFF" --argjson m "$MIN" '
       (if type == "array" then . else [] end) as $all
       | ($all | map(select(.directory == $d)) | sort_by(-.updated)) as $s
@@ -41,4 +41,5 @@ SESSIONS=$(oc_filter_only "$SESSIONS")
 db_sizes
 print_table "$SESSIONS"
 run_backup
+run_cleanup_legacy
 run_apply "$SESSIONS"

@@ -8,9 +8,11 @@
 | 🏃 Dry run first | `./oc-prune-db.sh` – nothing is modified |
 | 💥 Delete | `./oc-prune-db.sh --apply` – export, then delete |
 | 🗜️ Compact | `./oc-prune-db.sh --vacuum` – verified backup of the database, then compact it |
-| 🔒 Database | read-only (`sqlite3 -readonly`), the only exception is `--vacuum` |
+| 🧹 V1 leftovers | `./oc-prune-db.sh --cleanup-legacy` – backup, then delete stale V1 rows a v2 migration left behind |
+| 🔒 Database | read-only (`sqlite3 -readonly`), the exceptions are `--vacuum` and the legacy cleanup |
 | 📦 Export | every session is exported to `BACKUP` **before** it is deleted |
-| 🛰️ Remote backup | with `BACKUP_REMOTE`, the full database copy before `--vacuum` goes over SSH/rsync |
+| 🛰️ Remote backup | with `BACKUP_REMOTE`, the full database copy before `--vacuum`/`--cleanup-legacy` goes over SSH/rsync |
+| 🧬 Schemas | works with both opencode **v1** (`session`/`message`/`part`) and **v2** (`session_v2`/`session_message`/`session_part`) |
 
 ---
 
@@ -33,13 +35,16 @@
 
 ```
 Database (read-only): $HOME/.local/share/opencode/opencode.db
+  schema v2 (session_v2/session_message/session_part)
+  V1 rows 0 (left over by the v2 migration; cleaned with --cleanup-legacy)
+  opencode 2.0.12 (CLI) | sessions up to 2.0.12 (3 versions)
   file 4.59 GiB | WAL 59.1 MiB | freelist 0 B (0.0 %)
   sessions 381 (+ 199 subagents)
   Missing directories:
     /home/user/projects/legacy-tool                4 sessions (+2 subagents)
     /home/user/projects/gone-again                 3 sessions
   event 4.04 GiB | part 297.7 MiB | message 240.1 MiB | session 316.0 KiB
-  orphan events 0 (0 B) | data per directory: cached (snapshot 580/…)
+  orphan events 0 (0 B) | data per directory: cached (snapshot v2/completed/580/0)
 
 Rule: older than 30 days, keep at least 3 per directory
 Rule: missing directory, keep nothing
@@ -61,7 +66,7 @@ Dry run. To delete: ./oc-prune-db.sh --apply
 | `COUNT` | 🔢 | top-level sessions in the directory (subagent sessions not counted) |
 | `NEWEST` / `OLDEST` | 📅 | date of the youngest / oldest session |
 | `DELETE` | 🗑️ | how many sessions `--apply` would remove |
-| `MB` | 💾 | event + part data of that directory in the database (`-` while sizes are not computed yet) |
+| `MB` | 💾 | event + message/part data of that directory in the database (`-` while sizes are not computed yet) |
 | `NOTE` | 🏷️ | `missing` = directory no longer exists, `outside` = outside of `ROOT` |
 
 ### 📈 Besides the table
@@ -69,7 +74,9 @@ Dry run. To delete: ./oc-prune-db.sh --apply
 | | |
 |---|---|
 | 📂 | **Missing directories** with their session and subagent counts – your main cleanup targets |
-| 🏭 | **Table sizes** (`event`, `part`, `message`, `session`) and the **freelist** – space inside the file that a `--vacuum` could give back |
+| version | **Installed CLI** (`oc_cli_version`) and the `version` values the sessions in the active schema were written with; a mismatch between CLI major and schema is called out (`WARNING` for a v1 CLI on a v2 database, a note for a v2 CLI on a v1 database) |
+| 🏭 | **Table sizes** (`event`, `part`/`session_part`, `message`/`session_message`, `session`/`session_v2`) and the **freelist** – space inside the file that a `--vacuum` could give back |
+| 🧹 | **V1 rows** left over by a v2 migration (rows in `session` without a `session_v2` counterpart) – removed with `--cleanup-legacy` |
 | 🕳️ | **Orphan events** without a session (should be `0`) |
 | ⏱️ | **Scan progress** per directory (`oc-prune.sh`) or a single `0 s` query (`oc-prune-db.sh`) |
 
@@ -82,7 +89,11 @@ Dry run. To delete: ./oc-prune-db.sh --apply
 2. 🚫 **Missing directory**: if the directory is gone, **nothing is kept** – not even
    recent sessions.
 3. 🧬 On top of that the **subagent sessions** of those directories are removed, because
-   the `session` table has no `CASCADE` on `parent_id`.
+   the session tables have no `CASCADE` on `parent_id`.
+4. 🧹 In a database that opencode **v2** migrated in place, deleting through the v2 CLI
+   leaves the old V1 rows (`session`, `message`, `part`) behind. `--apply` therefore
+   removes the V1 copy of every deleted session subtree as well; rows of sessions that
+   were already deleted in v2 are removed separately with `--cleanup-legacy`.
 
 ---
 
@@ -94,8 +105,9 @@ that differ. Steps in **bold** are the ones that change something.
 ### `./oc-prune-db.sh` (no option) – dry run
 
 1. read environment and `.env`
-2. open the database **read-only**: file size, WAL, freelist, session count,
-   missing directories, table sizes, orphan events, data per directory
+2. detect the schema (V1, V2 or V2 with a still-running migration) and open the
+   database **read-only**: file size, WAL, freelist, session count,
+   missing directories, table sizes, V1 leftovers, orphan events, data per directory
 3. **read-only scan** of all top-level sessions (one `SELECT`; `oc-prune.sh` runs
    `opencode session list` per directory instead)
 4. the table with the `DELETE` counts and the total
@@ -104,16 +116,30 @@ that differ. Steps in **bold** are the ones that change something.
 
 ### `--apply` – export and delete
 
-1. 🛑 `pgrep -x opencode` – abort with code 1 while an instance runs
-2. `Export to: $BACKUP`, create the directory
-3. build the target list (rule 2 and rule 1), subagents of missing directories first
-4. **per session**: `opencode export <id> > $BACKUP/<directory>/<id>.json` → an empty
-   export **aborts** the run → `opencode session delete <id>`
-5. `Freelist after delete: …` plus the hint to compact with `--vacuum`
+1. 🛑 `pgrep -x opencode` / `pgrep -x opencode2` – abort with code 1 while an instance runs
+2. abort if a **V1 → V2 migration is still running** (the `kv` state is not `completed`)
+3. `Export to: $BACKUP`, create the directory
+4. build the target list (rule 2 and rule 1), subagents of missing directories first
+5. **per session**: `opencode export <id>` (v1) or `opencode session export <id>` (v2)
+   `> $BACKUP/<directory>/<id>.json` → an empty export **aborts** the run →
+   `opencode session delete <id>`
+6. in a migrated v2 database: delete the **stale V1 copy** of the session subtree
+   (`DELETE FROM session …`, cascades to `message`/`part`)
+7. `Freelist after delete: …` plus the hint to compact with `--vacuum`
+
+### `--cleanup-legacy` – remove V1 leftovers (backup-first)
+
+1. 🛑 `pgrep -x opencode` / `pgrep -x opencode2` – abort with code 1 while an instance runs
+2. abort unless the schema is **V2 with a completed migration** (and V1 tables exist)
+3. **backup** exactly like `--vacuum` (skipped with `--no-backup`): full database copy
+   in `$BACKUP` or, with `BACKUP_REMOTE`, uploaded via `rsync`
+4. **delete every `session` row without a `session_v2` counterpart** in one transaction
+   (`PRAGMA foreign_keys=ON`) – the old `message`/`part` rows cascade
+5. nothing else is touched; combine with `--apply`/`--vacuum` as needed
 
 ### `--vacuum` – backup and compact (with or without `--apply`)
 
-1. 🛑 `pgrep -x opencode` – abort with code 1 while an instance runs
+1. 🛑 `pgrep -x opencode` / `pgrep -x opencode2` – abort with code 1 while an instance runs
 2. **backup** (skipped with `--no-backup`):
    - without `BACKUP_REMOTE`: `$BACKUP` must already exist and have at least the
      size of the database free →
@@ -148,11 +174,14 @@ that differ. Steps in **bold** are the ones that change something.
 | Command | Steps that run |
 |---|---|
 | *(none)* | report + table (read-only) |
-| `--apply` | report + table → export + delete → freelist hint |
+| `--apply` | report + table → export + delete (+ V1 copy in a migrated v2 db) → freelist hint |
 | `--vacuum` | report + table → **backup** → **compact** |
-| `--apply --vacuum` | report + table → **backup** → export + delete → **compact** |
+| `--cleanup-legacy` | report + table → **backup** → **delete stale V1 rows** |
+| `--apply --vacuum` | report + table → **backup** → export + delete (+ V1 copy) → **compact** |
+| `--apply --cleanup-legacy` | report + table → **backup** → delete stale V1 rows → export + delete |
+| `--apply --vacuum --cleanup-legacy` | report + table → **backup** → delete stale V1 rows → export + delete → **compact** |
 | `--apply --vacuum --no-backup` | same, but without the backup copy |
-| `--no-backup` alone | same as a dry run (backup only ever matters with `--vacuum`) |
+| `--no-backup` alone | same as a dry run (backup only ever matters with `--vacuum`/`--cleanup-legacy`) |
 
 > ❗ The backup and the compaction always cover the **whole database** – `ONLY` has no
 > influence on them. `ONLY` only limits which sessions are shown, exported and deleted.
@@ -165,7 +194,7 @@ that differ. Steps in **bold** are the ones that change something.
 
 | File | Emoji | Purpose |
 |---|---|---|
-| `oc-lib.sh` | 📚 | shared logic: database report, table, totals, backup, `--apply`, `--vacuum` |
+| `oc-lib.sh` | 📚 | shared logic: schema detection, database report, table, totals, backup, `--apply`, `--vacuum`, legacy cleanup |
 | `oc-prune.sh` | 🐢 | scan with `opencode session list` per directory (shows progress) |
 | `oc-prune-db.sh` | 🐇 | scan with a single `SELECT` (0 s instead of ~70 s) |
 | `.env` | 🔐 | local configuration (gitignored), see `.env.example` |
@@ -183,19 +212,20 @@ by `oc_augment_missing` in both scripts.
 ## ⚙️ Configuration
 
 **Precedence: environment variable → `.env` → default.** Read as `ROOT`, `DAYS`, `MIN`,
-`BACKUP`, `BACKUP_REMOTE`, `DB`, `ONLY`, `SIZES`, `SIZE_CACHE`.
+`BACKUP`, `BACKUP_REMOTE`, `DB`, `ONLY`, `SIZES`, `SIZE_CACHE`, `OC_BIN`.
 
 | Variable | 🟢 Default | 📝 Meaning |
 |---|---|---|
 | `ROOT` | `$HOME/Code` | root that gets scanned; rows outside get `outside` |
 | `DAYS` | `30` | sessions older than that are candidates for deletion |
 | `MIN` | `3` | this many youngest sessions stay per directory |
-| `BACKUP` | `$HOME/opencode-export` | receives the exports of deleted sessions **and** (with `--vacuum`, if no `BACKUP_REMOTE`) the full database copy `opencode-<timestamp>.db`; the directory must already exist |
-| `BACKUP_REMOTE` | *(empty)* | `[user@]host:/absolute/path` – with `--vacuum` the full database copy is uploaded there via `ssh`/`rsync` instead of `$BACKUP` (no local temporary copy); exports still go to `$BACKUP` |
+| `BACKUP` | `$HOME/opencode-export` | receives the exports of deleted sessions **and** (with `--vacuum`/`--cleanup-legacy`, if no `BACKUP_REMOTE`) the full database copy `opencode-<timestamp>.db`; the directory must already exist |
+| `BACKUP_REMOTE` | *(empty)* | `[user@]host:/absolute/path` – with `--vacuum`/`--cleanup-legacy` the full database copy is uploaded there via `ssh`/`rsync` instead of `$BACKUP` (no local temporary copy); exports still go to `$BACKUP` |
 | `DB` | `~/.local/share/opencode/opencode.db` | opencode database |
 | `ONLY` | *(empty)* | work on this directory (and everything below) only |
 | `SIZES` | `1` | `0` skips the size computation (the `MB` column stays `-`) |
 | `SIZE_CACHE` | `~/.cache/oc-prune/db-data.tsv` | cache for the size computation |
+| `OC_BIN` | `opencode` | opencode binary to call (e.g. `opencode2` for a v2 preview installed under another name) |
 | `ENV_FILE` | `./.env` | path of an alternative `.env` |
 
 `.env` lives next to the scripts (`KEY=VALUE`, `#` lines are comments):
@@ -224,16 +254,26 @@ ONLY=/home/user/projects/legacy-tool ./oc-prune-db.sh --apply
 
 What happens:
 
-1. 🛑 `pgrep -x opencode` – if an instance is still running the script exits with code 1.
-2. 📤 `Export to: …` is printed and the directory is created.
-3. 📦 Per session: `opencode export <id> > $BACKUP/<directory>/<id>.json`, then and only
-   then `opencode session delete <id>`. An empty export aborts the run **before**
-   anything has been deleted.
-4. 🧬 Subagent sessions of missing directories run first, then the top-level sessions.
-5. 📊 at the end: `Freelist after delete: X` plus a hint that the file itself did not
+1. 🛑 `pgrep -x opencode` / `pgrep -x opencode2` – if an instance is still running the script exits with code 1.
+2. 📤 `Export to: ...` is printed and the directory is created.
+3. 📦 Per session: `opencode export <id>` (v1) or `opencode session export <id>` (v2),
+   then and only then `opencode session delete <id>`. An empty export aborts the run
+   **before** anything has been deleted.
+4. 🧹 In a migrated v2 database the stale V1 copy of the session subtree is deleted
+   afterwards (the v2 CLI does not touch the old `session`/`message`/`part` tables).
+5. 🧬 Subagent sessions of missing directories run first, then the top-level sessions.
+6. 📊 at the end: `Freelist after delete: X` plus a hint that the file itself did not
    shrink – and how to get the space back.
 
 > ❗ Without `--apply` nothing is exported and nothing is deleted.
+
+To remove rows of sessions that were already deleted in v2 (V1 rows without a
+`session_v2` counterpart), use the separate maintenance action:
+
+```bash
+./oc-prune-db.sh --cleanup-legacy            # backup, then delete stale V1 rows
+./oc-prune-db.sh --cleanup-legacy --no-backup
+```
 
 ---
 
@@ -249,6 +289,7 @@ it.
 ./oc-prune-db.sh --vacuum             # opencode must be closed
 ./oc-prune-db.sh --apply --vacuum     # backup, delete, then compact
 ./oc-prune-db.sh --apply --vacuum --no-backup   # without the backup copy
+./oc-prune-db.sh --cleanup-legacy     # backup, then delete stale V1 rows (migrated v2 db)
 ```
 
 The exact step list of every command is in
@@ -370,16 +411,20 @@ events store a **full snapshot on every update** (114k snapshots of 31.5k messag
 ## 🗄️ Database access
 
 Every report, scan and table uses `sqlite3 -readonly` (plus `PRAGMA cache_size=8000`),
-and so does the local backup copy (`sqlite3 -readonly "$DB" ".backup …"`). The
-exception is the `--vacuum` path: `run_vacuum` opens the database writable for the
+and so does the local backup copy (`sqlite3 -readonly "$DB" ".backup ..."`). The
+exceptions are the `--vacuum` path (`run_vacuum` opens the database writable for the
 checkpoint and the `VACUUM INTO`, and when `BACKUP_REMOTE` is set `run_backup` also
-opens it writable for the checkpoint that makes the raw `rsync` snapshot consistent.
-Besides our own size cache under `~/.cache/oc-prune/`, the files under `$BACKUP` and
-the backup on `$BACKUP_REMOTE`, nothing else is created.
+opens it writable for the checkpoint that makes the raw `rsync` snapshot consistent)
+and the V1 cleanup (`--apply` removes the stale V1 copy of each deleted session, and
+`--cleanup-legacy` removes all V1 rows without a `session_v2` counterpart – both run
+through a transaction with `PRAGMA foreign_keys=ON` and only after the v2 migration is
+complete). Besides our own size cache under `~/.cache/oc-prune/`, the files under
+`$BACKUP` and the backup on `$BACKUP_REMOTE`, nothing else is created.
 
 The `MB` values need a full scan of the `event` table (4 GiB, about 60 s) and are
-therefore cached; the key is `count/max(time_created)` so the cache stays valid while
-opencode is working. Later runs then take about **0 s** (without the directory scan).
+therefore cached; the key is `schema/count/max(time_created)/V1-rows` so the cache stays
+valid while opencode is working but is invalidated by a v1 → v2 upgrade or a legacy
+cleanup. Later runs then take about **0 s** (without the directory scan).
 
 | | First run | Later runs |
 |---|---|---|
@@ -393,8 +438,9 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 - 🐚 bash ≥ 4.4
 - 📊 `jq`
 - 🗄️ `sqlite3` ≥ 3.33 (for `-json`)
-- 🤖 `opencode` in `PATH`
-- 🔑 read access to the database (`--vacuum` needs write access to it)
+- 🤖 `opencode` in `PATH` (or `OC_BIN` pointing at it); v1 for the `session`/`message`/`part`
+  schema, v2 for `session_v2`/`session_message`/`session_part`
+- 🔑 read access to the database (`--vacuum`/`--cleanup-legacy` need write access to it)
 - 📐 `df`, `stat`, `pgrep` (standard coreutils / procps)
 - 🛰️ with `BACKUP_REMOTE`: `ssh` with key auth (`BatchMode=yes`), `rsync` and
   `sha256sum` on the remote, and an existing remote directory that is writable by
@@ -409,7 +455,11 @@ opencode is working. Later runs then take about **0 s** (without the directory s
 | 💥 `CAST(data AS BLOB)` over the 4 GiB `event` table gets killed by the OOM killer | use `length(data)` (counts characters, slightly underestimates multi-byte characters) plus `PRAGMA cache_size=8000` (otherwise ~3 GiB RSS, with it ~1,3 GiB) |
 | 🚫 `GROUP BY 1` with aggregates in the same select list is forbidden in SQLite | `GROUP BY <column>` |
 | 📤 Progress messages on stdout corrupt `SESSIONS=$(…)` | print them with `printf … >&2` |
-| 🎯 `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line (`…/opencode-prune/…`) | `pgrep -x opencode` |
+| 🧬 opencode v2 migrates the database in place and keeps the old `session`/`message`/`part` tables | the tool detects the schema (`session_v2` + the `kv` state), reads from the active tables only and removes the stale V1 copy on delete / with `--cleanup-legacy` |
+| 🚧 deleting or reading while the V1 → V2 migration is still running would mix old and new sessions | dry runs show `schema v2, V1 migration still running`; `--apply`/`--cleanup-legacy` abort until the migration is `completed` |
+| 🗣️ v1 has `opencode export`, v2 only `opencode session export` | `oc_export_session` picks the right command from the detected schema |
+| 🧟 V1 rows of sessions already deleted in v2 would reappear in a naive union | after a completed migration only `session_v2` is read; `--cleanup-legacy` removes those rows |
+| 🎯 `pgrep -f 'opencode'` also matches `vim opencode.json` and our own command line (`…/opencode-prune/…`) | `pgrep -x opencode` (and `-x opencode2` / the `OC_BIN` basename) |
 | 💥 a plain `VACUUM` wants twice the file size as free space and can fail halfway through | we reserve the expected compacted size (hard check before anything happens) but compact with `VACUUM INTO` + swap, so the original survives a failure – and a verified copy sits in `$BACKUP` already |
 | ☠️ a leftover `-wal` from the old file applied to the new one would corrupt it | the checkpoint empties the WAL first (checked), afterwards `-wal`/`-shm` are removed |
 | 📡 writing the backup onto an unmounted path would silently fill `/` | `$BACKUP` must already exist, otherwise the run stops before copying anything |
